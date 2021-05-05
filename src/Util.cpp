@@ -613,13 +613,24 @@ void run_with_large_stack(const std::function<void()> &action) {
     // Only exists for its address, which is used to compute remaining stack space.
     ULONG_PTR approx_stack_pos;
 
-    ULONG_PTR stack_low, stack_high;
-    GetCurrentThreadStackLimits(&stack_low, &stack_high);
-    ptrdiff_t stack_remaining = (char *)&approx_stack_pos - (char *)stack_low;
+    typedef void (WINAPI *GetCurrentThreadStackLimits_t)(PULONG_PTR, PULONG_PTR);
+    GetCurrentThreadStackLimits_t GetCurrentThreadStackLimits =
+        reinterpret_cast<GetCurrentThreadStackLimits_t>(GetProcAddress(GetModuleHandle("kernel32"), "GetCurrentThreadStackLimits"));
+    bool switch_to_fiber;
+    if (GetCurrentThreadStackLimits) {
+        ULONG_PTR stack_low, stack_high;
+        GetCurrentThreadStackLimits(&stack_low, &stack_high);
+        ptrdiff_t stack_remaining = (char *)&approx_stack_pos - (char *)stack_low;
+        switch_to_fiber = (stack_remaining < required_stack);
+        if (switch_to_fiber) {
+            debug(1) << "Insufficient stack space (" << stack_remaining << " bytes). Switching to fiber with " << required_stack << "-byte stack.\n";
+        }
+    } else {
+        switch_to_fiber = true;
+        debug(1) << "Switching to fiber with " << required_stack << "-byte stack.\n";
+    }
 
-    if (stack_remaining < required_stack) {
-        debug(1) << "Insufficient stack space (" << stack_remaining << " bytes). Switching to fiber with " << required_stack << "-byte stack.\n";
-
+    if (switch_to_fiber) {
         auto was_a_fiber = IsThreadAFiber();
 
         auto *main_fiber = was_a_fiber ? GetCurrentFiber() : ConvertThreadToFiber(nullptr);
