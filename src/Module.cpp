@@ -39,7 +39,8 @@ namespace Internal {
 std::map<Output, const OutputInfo> get_output_info(const Target &target) {
     constexpr bool IsMulti = true;
     constexpr bool IsSingle = false;
-    const bool is_windows_coff = target.os == Target::Windows;
+    const bool is_windows_coff = target.os == Target::Windows &&
+                                 !target.has_feature(Target::MinGW);
     std::map<Output, const OutputInfo> ext = {
         {Output::assembly, {"assembly", ".s", IsMulti}},
         {Output::bitcode, {"bitcode", ".bc", IsMulti}},
@@ -107,7 +108,7 @@ public:
                                      const std::string &suffix,
                                      const Target &target,
                                      bool in_front = false) {
-        const char *ext = (target.os == Target::Windows) ? ".obj" : ".o";
+        const char *ext = (target.os == Target::Windows && !target.has_feature(Target::MinGW)) ? ".obj" : ".o";
         return add_temp_file(base_path_name, suffix + ext, target, in_front);
     }
 

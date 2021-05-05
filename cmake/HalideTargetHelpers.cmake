@@ -28,6 +28,11 @@ function(_Halide_cmake_target OUTVAR)
     string(TOLOWER "${CMAKE_SYSTEM_NAME}" os)
     list(TRANSFORM os REPLACE "^darwin$" "osx")
 
+    # Check for MinGW
+    if(MINGW)
+        set(os "${os}-mingw")
+    endif()
+
     set(${OUTVAR} "${arch}-${bits}-${os}" PARENT_SCOPE)
 endfunction()
 

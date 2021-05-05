@@ -298,7 +298,7 @@ function(_Halide_get_platform_details OUT_GEN OUT_XC OUT_OBJ OUT_STATIC)
         set(ARGN "${Halide_HOST_TARGET}")
     endif ()
 
-    if ("${ARGN}" MATCHES "windows")
+    if ("${ARGN}" MATCHES "windows" AND NOT "${ARGN}" MATCHES "mingw")
         # Otherwise, all targets are windows, so Halide emits .obj files
         set(${OUT_OBJ} ".obj" PARENT_SCOPE)
         set(${OUT_STATIC} ".lib" PARENT_SCOPE)

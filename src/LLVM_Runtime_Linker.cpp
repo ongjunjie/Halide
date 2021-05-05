@@ -103,6 +103,7 @@ DECLARE_CPP_INITMOD(linux_host_cpu_count)
 DECLARE_CPP_INITMOD(linux_yield)
 DECLARE_CPP_INITMOD(matlab)
 DECLARE_CPP_INITMOD(metadata)
+DECLARE_CPP_INITMOD(mingw_math)
 DECLARE_CPP_INITMOD(module_aot_ref_count)
 DECLARE_CPP_INITMOD(module_jit_ref_count)
 DECLARE_CPP_INITMOD(msan)
@@ -390,7 +391,11 @@ llvm::Triple get_triple_for_target(const Target &target) {
         } else if (target.os == Target::Windows) {
             triple.setVendor(llvm::Triple::PC);
             triple.setOS(llvm::Triple::Win32);
-            triple.setEnvironment(llvm::Triple::MSVC);
+            if (target.has_feature(Target::MinGW)) {
+                triple.setEnvironment(llvm::Triple::GNU);
+            } else {
+                triple.setEnvironment(llvm::Triple::MSVC);
+            }
             if (target.has_feature(Target::JIT)) {
                 // Use ELF for jitting
                 triple.setObjectFormat(llvm::Triple::ELF);
@@ -581,8 +586,8 @@ void link_modules(std::vector<std::unique_ptr<llvm::Module>> &modules, Target t,
     // "halide_" that is weak will be retained. There are a few
     // symbols for which this convention is not followed and these are
     // in this set.
-    const std::set<string> retain = {"__stack_chk_guard",
-                                     "__stack_chk_fail"};
+    std::set<string> retain = {"__stack_chk_guard",
+                               "__stack_chk_fail"};
 
     // COMDAT is not supported in MachO object files, hence it does
     // not work on Mac OS or iOS. These sometimes show up in the
@@ -601,6 +606,13 @@ void link_modules(std::vector<std::unique_ptr<llvm::Module>> &modules, Target t,
             global_obj.setComdat(nullptr);
         }
         modules[0]->getComdatSymbolTable().clear();
+    }
+
+    if (t.has_feature(Target::MinGW)) {
+        retain.insert({"sincos", "sincosf",
+                       "asinh", "asinhf",
+                       "acosh", "acoshf",
+                       "atanh", "atanhf"});
     }
 
     // Enumerate the global variables.
@@ -896,6 +908,9 @@ std::unique_ptr<llvm::Module> get_initial_module_for_target(Target t, llvm::LLVM
                     modules.push_back(get_initmod_windows_threads(c, bits_64, debug));
                 }
                 modules.push_back(get_initmod_windows_get_symbol(c, bits_64, debug));
+                if (t.has_feature(Target::MinGW)) {
+                    modules.push_back(get_initmod_mingw_math(c, bits_64, debug));
+                }
             } else if (t.os == Target::IOS) {
                 modules.push_back(get_initmod_posix_allocator(c, bits_64, debug));
                 modules.push_back(get_initmod_posix_error_handler(c, bits_64, debug));
