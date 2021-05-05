@@ -37,7 +37,8 @@ def main():
 
         f.compile_to_file(os.path.join(tmpdir, "f_all"), args)
         assert os.path.isfile(os.path.join(tmpdir, "f_all.h"))
-        if hl.get_target_from_environment().os == hl.TargetOS.Windows:
+        if (hl.get_target_from_environment().os == hl.TargetOS.Windows
+                and not hl.get_target_from_environment().has_feature(hl.TargetFeature.MinGW)):
             assert os.path.isfile(os.path.join(tmpdir, "f_all.obj"))
         else:
             assert os.path.isfile(os.path.join(tmpdir, "f_all.o"))

@@ -28,6 +28,9 @@ add_executable(retrain_cost_model
                retrain_cost_model.cpp
                ${WF_CPP})
 target_link_libraries(retrain_cost_model PRIVATE cost_model train_cost_model Halide::Halide Halide::Plugin)
+if(WIN32)
+    target_link_libraries(retrain_cost_model PRIVATE dbghelp)
+endif()
 
 ##
 # Main autoscheduler library

@@ -41,7 +41,7 @@ static void cpuid(int info[4], int infoType, int extra) {
 // CPU feature detection code taken from ispc
 // (https://github.com/ispc/ispc/blob/master/builtins/dispatch.ll)
 
-#ifdef _LP64
+#ifdef __x86_64__
 void cpuid(int info[4], int infoType, int extra) {
     __asm__ __volatile__(
         "cpuid                 \n\t"

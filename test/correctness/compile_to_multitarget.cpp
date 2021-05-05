@@ -11,7 +11,7 @@ std::string get_fname(const std::string &base) {
 
 void test_compile_to_static_library(Func j) {
     std::string fname = get_fname("c1");
-    const char *a = get_host_target().os == Target::Windows ? ".lib" : ".a";
+    const char *a = get_host_target().os == Target::Windows && !get_host_target().has_feature(Target::MinGW) ? ".lib" : ".a";
 
     std::vector<Target> targets = {
         Target("host-profile-no_bounds_query"),
@@ -38,7 +38,7 @@ void test_compile_to_static_library(Func j) {
 
 void test_compile_to_object_files(Func j) {
     std::string fname = get_fname("c2");
-    const char *o = get_host_target().os == Target::Windows ? ".obj" : ".o";
+    const char *o = get_host_target().os == Target::Windows && !get_host_target().has_feature(Target::MinGW) ? ".obj" : ".o";
 
     std::vector<std::string> target_strings = {
         "host-profile-no_bounds_query",
@@ -71,7 +71,7 @@ void test_compile_to_object_files(Func j) {
 
 void test_compile_to_object_files_no_runtime(Func j) {
     std::string fname = get_fname("c3");
-    const char *o = get_host_target().os == Target::Windows ? ".obj" : ".o";
+    const char *o = get_host_target().os == Target::Windows && !get_host_target().has_feature(Target::MinGW) ? ".obj" : ".o";
 
     std::vector<std::string> target_strings = {
         "host-profile-no_bounds_query-no_runtime",
@@ -103,7 +103,7 @@ void test_compile_to_object_files_no_runtime(Func j) {
 
 void test_compile_to_object_files_single_target(Func j) {
     std::string fname = get_fname("c4");
-    const char *o = get_host_target().os == Target::Windows ? ".obj" : ".o";
+    const char *o = get_host_target().os == Target::Windows && !get_host_target().has_feature(Target::MinGW) ? ".obj" : ".o";
 
     std::vector<std::string> target_strings = {
         "host-debug",
@@ -131,8 +131,8 @@ void test_compile_to_object_files_single_target(Func j) {
 
 void test_compile_to_everything(Func j, bool do_object) {
     std::string fname = get_fname(do_object ? "c5" : "c6");
-    const char *a = get_host_target().os == Target::Windows ? ".lib" : ".a";
-    const char *o = get_host_target().os == Target::Windows ? ".obj" : ".o";
+    const char *a = get_host_target().os == Target::Windows && !get_host_target().has_feature(Target::MinGW) ? ".lib" : ".a";
+    const char *o = get_host_target().os == Target::Windows && !get_host_target().has_feature(Target::MinGW) ? ".obj" : ".o";
 
     std::vector<std::string> target_strings = {
         "host-profile-no_bounds_query",
