@@ -285,9 +285,13 @@ public:
         check("vpacko(v*.w,v*.w)", hvx_width / 2, in_u16(2 * x + 1));
         check("vdeal(v*,v*,r*)", hvx_width / 4, in_u32(2 * x + 1));
 
-        check("vlut32(v*.b,v*.b,r*)", hvx_width / 1, in_u8(3 * x / 2));
-        check("vlut16(v*.b,v*.h,r*)", hvx_width / 2, in_u16(3 * x / 2));
-        check("vlut16(v*.b,v*.h,r*)", hvx_width / 2, in_u32(3 * x / 2));
+        check("vdelta(v*,v*)", hvx_width / 1, in_u8(3 * x / 2));
+        check("vdelta(v*,v*)", hvx_width / 2, in_u16(3 * x / 2));
+        check("vdelta(v*,v*)", hvx_width / 2, in_u32(3 * x / 2));
+        check("vdelta(v*,v*)", hvx_width * 3, in_u16(x * 3));
+        check("vdelta(v*,v*)", hvx_width * 3, in_u8(x * 3));
+        check("vdelta(v*,v*)", hvx_width * 4, in_u16(x * 4));
+        check("vdelta(v*,v*)", hvx_width * 4, in_u8(x * 4));
 
         check("vlut32(v*.b,v*.b,r*)", hvx_width / 1, in_u8(u8_1));
         check("vlut32(v*.b,v*.b,r*)", hvx_width / 1, in_u8(clamp(u16_1, 0, 63)));
@@ -295,11 +299,6 @@ public:
         check("vlut16(v*.b,v*.h,r*)", hvx_width / 2, in_u16(clamp(u16_1, 0, 15)));
         check("vlut16(v*.b,v*.h,r*)", hvx_width / 2, in_u32(u8_1));
         check("vlut16(v*.b,v*.h,r*)", hvx_width / 2, in_u32(clamp(u16_1, 0, 15)));
-
-        // This tests the case of vlut with > 256 elements (thus forcing us to split into
-        // multiple vluts)
-        check("vlut16(v*.b,v*.h,r*)", hvx_width * 3, in_u16(x * 3));
-        check("vlut32(v*.b,v*.b,r*)", hvx_width * 3, in_u8(x * 3));
 
         check("v*.ub = vpack(v*.h,v*.h):sat", hvx_width / 1, u8_sat(i16_1));
         check("v*.b = vpack(v*.h,v*.h):sat", hvx_width / 1, i8_sat(i16_1));
@@ -459,7 +458,7 @@ public:
         check("vmpyi(v*.h,v*.h)", hvx_width / 2, i16_1 * i16_2);
         check("vmpyio(v*.w,v*.h)", hvx_width / 2, i32_1 * i32(i16_1));
         check("vmpyie(v*.w,v*.uh)", hvx_width / 2, i32_1 * i32(u16_1));
-        check("vmpy(v*.uh,v*.uh)", hvx_width / 2, u32_1 * u32(u16_1));
+        check("vmpyie(v*.w,v*.uh)", hvx_width / 2, u32_1 * u32(u16_1));
         check("vmpyieo(v*.h,v*.h)", hvx_width / 4, i32_1 * i32_2);
         // The inconsistency in the expected instructions here is
         // correct. For bytes, the unsigned value is first, for half
@@ -613,19 +612,16 @@ public:
         check("vrmpy(v*.ub,v*.b)", hvx_width, i16(u8_1)*i8_1 + i16(u8_2)*i8_2 + i16(u8_3)*i8_3 + i16(u8_4)*i8_4);
 #endif
 
-#if 0
-        // Temporarily disabling this vrmpy test because of https://github.com/halide/Halide/issues/4248
         // These should also work with 16 bit results. However, it is
         // only profitable to do so if the interleave simplifies away.
         Expr u8_4x4[] = {
-            in_u8(4*x + 0),
-            in_u8(4*x + 1),
-            in_u8(4*x + 2),
-            in_u8(4*x + 3),
+            in_u8(4 * x + 0),
+            in_u8(4 * x + 1),
+            in_u8(4 * x + 2),
+            in_u8(4 * x + 3),
         };
-        check("vrmpy(v*.ub,r*.b)", hvx_width/2, i16(u8_4x4[0])*127 + i16(u8_4x4[1])*126 + i16(u8_4x4[2])*-125 + i16(u8_4x4[3])*124);
+        check("vrmpy(v*.ub,r*.b)", hvx_width / 2, i16(u8_4x4[0]) * 127 + i16(u8_4x4[1]) * 126 + i16(u8_4x4[2]) * -125 + i16(u8_4x4[3]) * 124);
 
-#endif
         // Make sure it doesn't generate if the operands don't interleave.
         check("vmpa(v*.ub,r*.b)", hvx_width, i16(u8_1) * 127 + i16(u8_2) * -126 + i16(u8_3) * 125 + i16(u8_4) * 124);
 
@@ -665,10 +661,13 @@ public:
         check("v*.w  = vrmpy(v*.ub,v*.b)", hvx_width / 4, sum(i16(in_u8(rfac * x + r)) * in_i8(rfac * x + r + 32)));
         check("v*.w  = vrmpy(v*.b,v*.b)", hvx_width / 4, sum(i16(in_i8(rfac * x + r)) * in_i8(rfac * x + r + 32)));
         check("v*.uw += vrmpy(v*.ub,r*.ub)", hvx_width / 4, sum(u32(in_u8(rfac * x + r))));
+        check("v*.w += vrmpy(v*.ub,r*.b)", hvx_width / 4, sum(i32(in_u8(rfac * x + r))));
         check("v*.uw = vrmpy(v*.ub,r*.ub)", hvx_width / 4, sum(u32(in_u8(rfac * x + r)) * 34));
         check("v*.uw += vrmpy(v*.ub,r*.ub)", hvx_width / 4, sum(u32(in_u8(rfac * x + r)) * u8(r)));
+        check("v*.uw += vrmpy(v*.ub,r*.ub)", hvx_width / 4, sum(i32(in_u8(rfac * x + r)) * u8(r)));
         check("v*.w  += vrmpy(v*.ub,r*.b)", hvx_width / 4, sum(i32(in_u8(rfac * x + r)) * i8(r)));
         check("v*.uw += vrmpy(v*.ub,v*.ub)", hvx_width / 4, sum(u32(in_u8(rfac * x + r)) * in_u8(rfac * x + r + 32)));
+        check("v*.uw += vrmpy(v*.ub,v*.ub)", hvx_width / 4, sum(i32(in_u8(rfac * x + r)) * in_u8(rfac * x + r + 32)));
         check("v*.w  += vrmpy(v*.ub,v*.b)", hvx_width / 4, sum(i32(in_u8(rfac * x + r)) * in_i8(rfac * x + r + 32)));
         check("v*.w  += vrmpy(v*.b,v*.b)", hvx_width / 4, sum(i32(in_i8(rfac * x + r)) * in_i8(rfac * x + r + 32)));
         // Sliding window
@@ -696,9 +695,9 @@ public:
         check("v*:*.h += vtmpy(v*:*.ub, r*.b)", hvx_width, sum(i16(in_u8(x + r3))));
         check("v*:*.w += vtmpy(v*:*.h, r*.b)", hvx_width, sum(i32(in_i16(x + r3))));
         // TODO: This should work, a common stencil
-        //check("v*:*.h += vtmpy(v*:*.b, r*.b)", hvx_width, sum(i16(in_i8(x + r3)) * mux(r3, {1, 2, 1})));
-        //check("v*:*.h += vtmpy(v*:*.ub, r*.b)", hvx_width, sum(i16(in_u8(x + r3)) * mux(r3, {1, 2, 1})));
-        //check("v*:*.w += vtmpy(v*:*.h, r*.b)", hvx_width, sum(i32(in_i16(x + r3)) * mux(r3, {1, 2, 1})));
+        // check("v*:*.h += vtmpy(v*:*.b, r*.b)", hvx_width, sum(i16(in_i8(x + r3)) * mux(r3, {1, 2, 1})));
+        // check("v*:*.h += vtmpy(v*:*.ub, r*.b)", hvx_width, sum(i16(in_u8(x + r3)) * mux(r3, {1, 2, 1})));
+        // check("v*:*.w += vtmpy(v*:*.h, r*.b)", hvx_width, sum(i32(in_i16(x + r3)) * mux(r3, {1, 2, 1})));
     }
 
 private:
@@ -706,74 +705,13 @@ private:
 };
 
 int main(int argc, char **argv) {
-    Target host = get_host_target();
-    Target hl_target = get_target_from_environment();
-    printf("host is:      %s\n", host.to_string().c_str());
-    printf("HL_TARGET is: %s\n", hl_target.to_string().c_str());
-
-    Target t(Target::NoOS, Target::Hexagon, 32);
-    for (const auto &f : {Target::HVX,
-                          Target::HVX_v62,
-                          Target::HVX_v65,
-                          Target::HVX_v66}) {
-        if (hl_target.has_feature(f)) {
-            t.set_feature(f);
-        }
-    }
-    if (t == Target("hexagon-32-noos")) {
-        printf("[SKIP] No HVX target enabled.\n");
-        return 0;
-    }
-
-    SimdOpCheckHVX test_hvx(t);
-
-    if (argc > 1) {
-        test_hvx.filter = argv[1];
-        test_hvx.set_num_threads(1);
-    }
-
-    if (getenv("HL_SIMD_OP_CHECK_FILTER")) {
-        test_hvx.filter = getenv("HL_SIMD_OP_CHECK_FILTER");
-    }
-
-    const int seed = argc > 2 ? atoi(argv[2]) : time(nullptr);
-    std::cout << "simd_op_check test seed: " << seed << "\n";
-    test_hvx.set_seed(seed);
-
-    // Remove some features like simd_op_check.cpp used to do.
-
-    // TODO: multithreading here is the cause of https://github.com/halide/Halide/issues/3669;
-    // the fundamental issue is that we make one set of ImageParams to construct many
-    // Exprs, then realize those Exprs on arbitrary threads; it is known that sharing
-    // one Func across multiple threads is not guaranteed to be safe, and indeed, TSAN
-    // reports data races, of which some are likely 'benign' (e.g. Function.freeze) but others
-    // are highly suspect (e.g. Function.lock_loop_levels). Since multithreading here
-    // was added just to avoid having this test be the last to finish, the expedient 'fix'
-    // for now is to remove the multithreading. A proper fix could be made by restructuring this
-    // test so that every Expr constructed for testing was guaranteed to share no Funcs
-    // (Function.deep_copy() perhaps). Of course, it would also be desirable to allow Funcs, Exprs, etc
-    // to be usable across multiple threads, but that is a major undertaking that is
-    // definitely not worthwhile for present Halide usage patterns.
-    test_hvx.set_num_threads(1);
-
-    if (argc > 2) {
-        // Don't forget: if you want to run the standard tests to a specific output
-        // directory, you'll need to invoke with the first arg enclosed
-        // in quotes (to avoid it being wildcard-expanded by the shell):
-        //
-        //    correctness_simd_op_check "*" /path/to/output
-        //
-        test_hvx.output_directory = argv[2];
-    }
-    bool success = test_hvx.test_all();
-
-    // Compile a runtime for this target, for use in the static test.
-    compile_standalone_runtime(test_hvx.output_directory + "simd_op_check_runtime.o", test_hvx.target);
-
-    if (!success) {
-        return -1;
-    }
-
-    printf("Success!\n");
-    return 0;
+    return SimdOpCheckTest::main<SimdOpCheckHVX>(
+        argc, argv,
+        {
+            Target("hexagon-32-noos-hvx"),
+            Target("hexagon-32-noos-hvx-hvx_128"),
+            Target("hexagon-32-noos-hvx-hvx_128-hvx_v62"),
+            Target("hexagon-32-noos-hvx-hvx_128-hvx_v65"),
+            Target("hexagon-32-noos-hvx-hvx_128-hvx_v66"),
+        });
 }

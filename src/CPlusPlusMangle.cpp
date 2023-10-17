@@ -535,7 +535,11 @@ std::string mangle_type(const Type &type, const Target &target, PrevPrefixes &pr
         case 16:
             return "s";
         case 32:
-            return "i";
+            if (target.arch == Target::Hexagon) {
+                return "l";
+            } else {
+                return "i";
+            }
         case 64:
             if (target.os == Target::OSX ||
                 target.os == Target::IOS ||
@@ -557,7 +561,11 @@ std::string mangle_type(const Type &type, const Target &target, PrevPrefixes &pr
         case 16:
             return "t";
         case 32:
-            return "j";
+            if (target.arch == Target::Hexagon) {
+                return "m";
+            } else {
+                return "j";
+            }
         case 64:
             if (target.os == Target::OSX ||
                 target.os == Target::IOS ||

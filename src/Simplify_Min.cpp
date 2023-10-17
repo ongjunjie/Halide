@@ -97,6 +97,11 @@ Expr Simplify::visit(const Min *op, ExprInfo *bounds) {
              rewrite(min(max(x, y), min(z, x)), b) ||
              rewrite(min(max(x, y), min(z, y)), b) ||
 
+             rewrite(min(select(x, min(z, y), w), y), min(select(x, z, w), y)) ||
+             rewrite(min(select(x, min(z, y), w), z), min(select(x, y, w), z)) ||
+             rewrite(min(select(x, w, min(z, y)), y), min(select(x, w, z), y)) ||
+             rewrite(min(select(x, w, min(z, y)), z), min(select(x, w, y), z)) ||
+
              rewrite(min(intrin(Call::likely, x), x), b) ||
              rewrite(min(x, intrin(Call::likely, x)), a) ||
              rewrite(min(intrin(Call::likely_if_innermost, x), x), b) ||
@@ -127,6 +132,7 @@ Expr Simplify::visit(const Min *op, ExprInfo *bounds) {
                rewrite(min(x, max(y, x) + c0), a, 0 <= c0) ||
                rewrite(min(max(x, y) + c0, x), b, 0 <= c0) ||
                rewrite(min(max(x, y) + c0, y), b, 0 <= c0) ||
+               rewrite(min(max(x, y + c0), y), y, c0 > 0) ||
 
                (no_overflow_int(op->type) &&
                 (rewrite(min(max(c0 - x, x), c1), b, 2*c1 <= c0 + 1) ||
@@ -187,6 +193,12 @@ Expr Simplify::visit(const Min *op, ExprInfo *bounds) {
 
              rewrite(min(select(x, y, z), select(x, w, u)), select(x, min(y, w), min(z, u))) ||
 
+             // Hoist shuffles. The Shuffle visitor wants to sink
+             // extract_elements to the leaves, and those count as degenerate
+             // slices, so only hoist shuffles that grab more than one lane.
+             rewrite(min(slice(x, c0, c1, c2), slice(y, c0, c1, c2)), slice(min(x, y), c0, c1, c2), c2 > 1 && lanes_of(x) == lanes_of(y)) ||
+             rewrite(min(slice(x, c0, c1, c2), min(slice(y, c0, c1, c2), z)), min(slice(min(x, y), c0, c1, c2), z), c2 > 1 && lanes_of(x) == lanes_of(y)) ||
+             rewrite(min(slice(x, c0, c1, c2), min(z, slice(y, c0, c1, c2))), min(slice(min(x, y), c0, c1, c2), z), c2 > 1 && lanes_of(x) == lanes_of(y)) ||
              (no_overflow(op->type) &&
               (rewrite(min(min(x, y) + c0, x), min(x, y + c0), c0 > 0) ||
                rewrite(min(min(x, y) + c0, x), min(x, y) + c0, c0 < 0) ||
@@ -290,23 +302,19 @@ Expr Simplify::visit(const Min *op, ExprInfo *bounds) {
                rewrite(min((min(((y + c0)/c1), x)*c1), y + c2), min(x * c1, y + c2), c1 > 0 && c1 + c2 <= c0 + 1) ||
                rewrite(min((min(((y + c0)/c1), x)*c1) + c2, y), min(x * c1 + c2, y), c1 > 0 && c1 <= c0 + c2 + 1) ||
 
+               rewrite(min((x + c0)/c1, ((x + c2)/c3)*c4), (x + c0)/c1, c0 + c3 - c1 <= c2 && c1 > 0 && c3 > 0 && c1 * c4 == c3) ||
+               rewrite(min((x + c0)/c1, ((x + c2)/c3)*c4), ((x + c2)/c3)*c4, c2 <= c0 && c1 > 0 && c3 > 0 && c1 * c4 == c3) ||
+               rewrite(min(x/c1, ((x + c2)/c3)*c4), x/c1, c3 - c1 <= c2 && c1 > 0 && c3 > 0 && c1 * c4 == c3) ||
+               rewrite(min(x/c1, ((x + c2)/c3)*c4), ((x + c2)/c3)*c4, c2 <= 0 && c1 > 0 && c3 > 0 && c1 * c4 == c3) ||
+               rewrite(min((x + c0)/c1, (x/c3)*c4), (x + c0)/c1, c0 + c3 - c1 <= 0 && c1 > 0 && c3 > 0 && c1 * c4 == c3) ||
+               rewrite(min((x + c0)/c1, (x/c3)*c4), (x/c3)*c4, 0 <= c0 && c1 > 0 && c3 > 0 && c1 * c4 == c3) ||
+               rewrite(min(x/c1, (x/c3)*c4), (x/c3)*c4, c1 > 0 && c3 > 0 && c1 * c4 == c3) ||
+
                false )))) {
 
             return mutate(rewrite.result, bounds);
         }
         // clang-format on
-    }
-
-    const Shuffle *shuffle_a = a.as<Shuffle>();
-    const Shuffle *shuffle_b = b.as<Shuffle>();
-    if (shuffle_a && shuffle_b &&
-        shuffle_a->is_slice() &&
-        shuffle_b->is_slice()) {
-        if (a.same_as(op->a) && b.same_as(op->b)) {
-            return hoist_slice_vector<Min>(op);
-        } else {
-            return hoist_slice_vector<Min>(Min::make(a, b));
-        }
     }
 
     if (a.same_as(op->a) && b.same_as(op->b)) {

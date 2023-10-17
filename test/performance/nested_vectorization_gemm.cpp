@@ -10,9 +10,6 @@ int main(int argc, char **argv) {
         printf("[SKIP] Performance tests are meaningless and/or misleading under WebAssembly interpreter.\n");
         return 0;
     }
-    // We don't want to be sensitive to LLVM pulling the same tricks
-    // or not.
-    target.set_feature(Target::DisableLLVMLoopOpt);
 
     // 8-bit mat-mul into 32-bit accumulator
     {
@@ -135,7 +132,7 @@ int main(int argc, char **argv) {
                speed_up);
         if (speed_up < 0.5) {
             printf("The nested vectorization schedule was supposed to be faster!\n");
-            return -1;
+            return 1;
         }
     }
 
@@ -222,7 +219,7 @@ int main(int argc, char **argv) {
                speed_up);
         if (speed_up < 0.5) {
             printf("The nested vectorization schedule was supposed to be faster!\n");
-            return -1;
+            return 1;
         }
     }
 
@@ -286,7 +283,7 @@ int main(int argc, char **argv) {
             Buffer<int16_t> out(f_buf.width() - g_buf.width() - 128);
 
             // Uncomment to check the asm
-            //result.compile_to_assembly("/dev/stdout", {f, g}, target);
+            // result.compile_to_assembly("/dev/stdout", {f, g}, target);
 
             times[use_nested_vectorization] =
                 Tools::benchmark(10, 10, [&]() {
@@ -305,7 +302,7 @@ int main(int argc, char **argv) {
                speed_up);
         if (speed_up < 0.5) {
             printf("The nested vectorization schedule was supposed to be faster!\n");
-            return -1;
+            return 1;
         }
     }
     printf("Success!\n");
@@ -400,7 +397,7 @@ int main(int argc, char **argv) {
                speed_up);
         if (speed_up < 0.5) {
             printf("The nested vectorization schedule was supposed to be faster!\n");
-            return -1;
+            return 1;
         }
     }
 

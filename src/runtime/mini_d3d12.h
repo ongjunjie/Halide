@@ -546,7 +546,7 @@ typedef RPC_BINDING_HANDLE handle_t;
 #define RPC_MGR_EPV void
 
 /* rpcdcep.h */
-//#if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM)
+// #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM)
 
 typedef struct _RPC_VERSION {
     unsigned short MajorVersion;
@@ -572,7 +572,7 @@ typedef struct _RPC_MESSAGE {
     unsigned long RpcFlags;
 } RPC_MESSAGE, __RPC_FAR *PRPC_MESSAGE;
 
-//#endif /* WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM) */
+// #endif /* WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP | WINAPI_PARTITION_SYSTEM) */
 
 /* rpcndr.h */
 #ifndef DECLSPEC_NOVTABLE
@@ -715,8 +715,7 @@ _Post_equal_to_(pp) _Post_satisfies_(return == pp) void **IID_PPV_ARGS_Helper(T 
 #define DECLARE_INTERFACE(iface)                  \
     typedef interface iface {                     \
         const struct iface##Vtbl FAR *lpVtbl;     \
-    }                                             \
-    iface;                                        \
+    } iface;                                      \
     typedef const struct iface##Vtbl iface##Vtbl; \
     const struct iface##Vtbl
 #else
@@ -725,8 +724,7 @@ _Post_equal_to_(pp) _Post_satisfies_(return == pp) void **IID_PPV_ARGS_Helper(T 
 #define DECLARE_INTERFACE(iface)            \
     typedef interface iface {               \
         struct iface##Vtbl FAR *lpVtbl;     \
-    }                                       \
-    iface;                                  \
+    } iface;                                \
     typedef struct iface##Vtbl iface##Vtbl; \
     struct iface##Vtbl
 #endif
@@ -6755,7 +6753,7 @@ interface IDXGIAdapter1 {
 #endif /* __IDXGIAdapter1_INTERFACE_DEFINED__ */
 
 // NOTE(marcos): declaring CreateDXGIFactory "1" since it works on UWP as well
-//HRESULT WINAPI CreateDXGIFactory1(REFIID riid, _COM_Outptr_ void **ppFactory);
+// HRESULT WINAPI CreateDXGIFactory1(REFIID riid, _COM_Outptr_ void **ppFactory);
 typedef HRESULT(WINAPI *PFN_CREATEDXGIFACORY1)(REFIID riid, _COM_Outptr_ void **ppFactory);
 
 DEFINE_GUID(IID_IDXGIObject, 0xaec22fb8, 0x76f3, 0x4639, 0x9b, 0xe0, 0x28, 0xeb, 0x43, 0xa6, 0x7a, 0x2e);

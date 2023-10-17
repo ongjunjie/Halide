@@ -275,6 +275,16 @@ private:
         return expr;
     }
 
+    Expr give_up_and_shuffle(const Expr &e) {
+        // Uh-oh, we don't know how to deinterleave this vector expression
+        // Make llvm do it
+        std::vector<int> indices;
+        for (int i = 0; i < new_lanes; i++) {
+            indices.push_back(starting_lane + lane_stride * i);
+        }
+        return Shuffle::make({e}, indices);
+    }
+
     Expr visit(const Variable *op) override {
         if (op->type.is_scalar()) {
             return op;
@@ -302,13 +312,7 @@ private:
                        lane_stride == 3) {
                 return Variable::make(t, op->name + ".lanes_2_of_3", op->image, op->param, op->reduction_domain);
             } else {
-                // Uh-oh, we don't know how to deinterleave this vector expression
-                // Make llvm do it
-                std::vector<int> indices;
-                for (int i = 0; i < new_lanes; i++) {
-                    indices.push_back(starting_lane + lane_stride * i);
-                }
-                return Shuffle::make({op}, indices);
+                return give_up_and_shuffle(op);
             }
         }
     }
@@ -319,6 +323,17 @@ private:
         } else {
             Type t = op->type.with_lanes(new_lanes);
             return Cast::make(t, mutate(op->value));
+        }
+    }
+
+    Expr visit(const Reinterpret *op) override {
+        if (op->type.is_scalar()) {
+            return op;
+        } else if (op->type.bits() != op->value.type().bits()) {
+            return give_up_and_shuffle(op);
+        } else {
+            Type t = op->type.with_lanes(new_lanes);
+            return Reinterpret::make(t, mutate(op->value));
         }
     }
 
@@ -334,11 +349,7 @@ private:
             // can just deinterleave the args.
 
             // Beware of intrinsics for which this is not true!
-            std::vector<Expr> args(op->args.size());
-            for (size_t i = 0; i < args.size(); i++) {
-                args[i] = mutate(op->args[i]);
-            }
-
+            auto args = mutate(op->args);
             return Call::make(t, op->name, args, op->call_type,
                               op->func, op->value_index, op->image, op->param);
         }
@@ -367,6 +378,21 @@ private:
             int idx = i * lane_stride + starting_lane;
             indices.push_back(op->indices[idx]);
         }
+
+        // If this is extracting a single lane, try to recursively deinterleave rather
+        // than leaving behind a shuffle.
+        if (indices.size() == 1) {
+            int index = indices.front();
+            for (const auto &i : op->vectors) {
+                if (index < i.type().lanes()) {
+                    ScopedValue<int> lane(starting_lane, index);
+                    return mutate(i);
+                }
+                index -= i.type().lanes();
+            }
+            internal_error << "extract_lane index out of bounds: " << Expr(op) << " " << index << "\n";
+        }
+
         return Shuffle::make(op->vectors, indices);
     }
 };
@@ -655,6 +681,16 @@ class Interleaver : public IRMutator {
 
         // Not enough stores collected.
         if (stores.size() != (size_t)expected_stores) {
+            return Stmt();
+        }
+
+        // Too many stores and lanes to represent in a single vector
+        // type.
+        int max_bits = sizeof(halide_type_t::lanes) * 8;
+        // mul_would_overflow is for signed types, but vector lanes
+        // are unsigned, so add a bit.
+        max_bits++;
+        if (mul_would_overflow(max_bits, stores.size(), lanes)) {
             return Stmt();
         }
 

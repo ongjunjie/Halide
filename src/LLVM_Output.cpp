@@ -360,6 +360,17 @@ void emit_file(const llvm::Module &module_in, Internal::LLVMOStream &out,
     }
 
     // Build up all of the passes that we want to do to the module.
+
+    // NOTE: use of the "legacy" PassManager here is still required; it is deprecated
+    // for optimization, but is still the only complete API for codegen as of work-in-progress
+    // LLVM14. At the time of this comment (Dec 2021), there is no firm plan as to when codegen will
+    // be fully available in the new PassManager, so don't worry about this 'legacy'
+    // tag until there's any indication that the old APIs start breaking.
+    //
+    // See:
+    // https://lists.llvm.org/pipermail/llvm-dev/2021-April/150100.html
+    // https://releases.llvm.org/13.0.0/docs/ReleaseNotes.html#changes-to-the-llvm-ir
+    // https://groups.google.com/g/llvm-dev/c/HoS07gXx0p8
     llvm::legacy::PassManager pass_manager;
 
     pass_manager.add(new llvm::TargetLibraryInfoWrapperPass(llvm::Triple(module->getTargetTriple())));
@@ -367,8 +378,18 @@ void emit_file(const llvm::Module &module_in, Internal::LLVMOStream &out,
     // Make sure things marked as always-inline get inlined
     pass_manager.add(llvm::createAlwaysInlinerLegacyPass());
 
+#if LLVM_VERSION < 170
     // Remove any stale debug info
+    //
+    // Note: this pass was added in https://github.com/halide/Halide/pull/2060;
+    // based on the comments, it looks like it was an attempt to fix an error,
+    // but didn't actually fix it, and (apparently) just got left in?
+    //
+    // There is a 'new' equivalent that we could add in the optimization pass
+    // in Codegen_LLVM.cpp, but since this seems to be have added in error,
+    // we're just going to elide it for LLVM >= 17.0
     pass_manager.add(llvm::createStripDeadDebugInfoPass());
+#endif
 
     // Enable symbol rewriting. This allows code outside libHalide to
     // use symbol rewriting when compiling Halide code (for example, by

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "CodeGen_C.h"
 #include "DeviceArgument.h"
 #include "Expr.h"
 
@@ -68,14 +69,42 @@ struct CodeGen_GPU_Dev {
      * uniform within the workgroup. */
     static bool is_buffer_constant(const Stmt &kernel, const std::string &buffer);
 
+    /** Modifies predicated loads and stores to be non-predicated, since most
+     * GPU backends do not support predication. */
+    static Stmt scalarize_predicated_loads_stores(Stmt &s);
+
     /** An mask describing which type of memory fence to use for the gpu_thread_barrier()
-    * intrinsic.  Not all GPUs APIs support all types.
-    */
+     * intrinsic.  Not all GPUs APIs support all types.
+     */
     enum MemoryFenceType {
         None = 0,    // No fence required (just a sync)
         Device = 1,  // Device/global memory fence
         Shared = 2   // Threadgroup/shared memory fence
     };
+};
+
+/** A base class for GPU backends that require C-like shader output.
+ * GPU backends derive from and specialize this class. */
+class CodeGen_GPU_C : public CodeGen_C {
+public:
+    /** OpenCL and WGSL use different syntax than C for immediate vectors. This
+    enum defines which style should be used by the backend. */
+    enum class VectorDeclarationStyle {
+        CLikeSyntax = 0,
+        OpenCLSyntax = 1,
+        WGSLSyntax = 2,
+    };
+
+    CodeGen_GPU_C(std::ostream &s, Target t)
+        : CodeGen_C(s, t) {
+    }
+
+protected:
+    using CodeGen_C::visit;
+    void visit(const Shuffle *op) override;
+    void visit(const Call *op) override;
+
+    VectorDeclarationStyle vector_declaration_style = VectorDeclarationStyle::CLikeSyntax;
 };
 
 }  // namespace Internal

@@ -32,9 +32,7 @@ std::pair<std::string, bool> get_env_variable(char const *env_var_name) {
 }
 
 bool use_noboundsquery_feature() {
-    std::string value;
-    bool read;
-    std::tie(value, read) = get_env_variable("HL_MULTITARGET_TEST_USE_NOBOUNDSQUERY_FEATURE");
+    auto [value, read] = get_env_variable("HL_MULTITARGET_TEST_USE_NOBOUNDSQUERY_FEATURE");
     if (!read) {
         return false;
     }
@@ -59,14 +57,14 @@ int my_can_use_target_features(int count, const uint64_t *features) {
 
 int main(int argc, char **argv) {
     const int W = 32, H = 32;
-    Buffer<uint32_t> output(W, H);
+    Buffer<uint32_t, 2> output(W, H);
 
     halide_set_error_handler(my_error_handler);
     halide_set_custom_can_use_target_features(my_can_use_target_features);
 
     if (HalideTest::multitarget(output) != 0) {
         printf("Error at multitarget\n");
-        return -1;
+        return 1;
     }
 
     // Verify output.
@@ -76,7 +74,7 @@ int main(int argc, char **argv) {
             const uint32_t actual = output(x, y);
             if (actual != expected) {
                 printf("Error at %d, %d: expected %x, got %x\n", x, y, expected, actual);
-                return -1;
+                return 1;
             }
         }
     }
@@ -86,22 +84,22 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 10; ++i) {
         if (HalideTest::multitarget(output) != 0) {
             printf("Error at multitarget\n");
-            return -1;
+            return 1;
         }
     }
     if (can_use_count != 1) {
         printf("Error: halide_can_use_target_features was called %d times!\n", (int)can_use_count);
-        return -1;
+        return 1;
     }
 
     {
         // Verify that the multitarget wrapper code propagates nonzero error
         // results back to the caller properly.
-        Buffer<uint8_t> bad_type(W, H);
+        Buffer<uint8_t, 2> bad_type(W, H);
         int result = HalideTest::multitarget(bad_type);
         if (result != halide_error_code_bad_type) {
             printf("Error: expected to fail with halide_error_code_bad_type (%d) but actually got %d!\n", (int)halide_error_code_bad_type, result);
-            return -1;
+            return 1;
         }
     }
 

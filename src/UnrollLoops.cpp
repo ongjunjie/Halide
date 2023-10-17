@@ -4,7 +4,9 @@
 #include "IRMutator.h"
 #include "IROperator.h"
 #include "Simplify.h"
+#include "SimplifyCorrelatedDifferences.h"
 #include "Substitute.h"
+#include "UniquifyVariableNames.h"
 
 using std::pair;
 using std::vector;
@@ -82,6 +84,11 @@ class UnrollLoops : public IRMutator {
             Stmt iters;
             for (int i = e->value - 1; i >= 0; i--) {
                 Stmt iter = substitute(for_loop->name, for_loop->min + i, body);
+                // It's necessary to eagerly simplify this iteration
+                // here to resolve things like muxes down to a single
+                // item before we go and make N copies of something of
+                // size N.
+                iter = simplify(iter);
                 if (!iters.defined()) {
                     iters = iter;
                 } else {
@@ -92,7 +99,7 @@ class UnrollLoops : public IRMutator {
                 }
             }
 
-            return simplify(iters);
+            return iters;
 
         } else {
             return IRMutator::visit(for_loop);
@@ -118,7 +125,9 @@ public:
 }  // namespace
 
 Stmt unroll_loops(const Stmt &s) {
-    return UnrollLoops().mutate(s);
+    Stmt stmt = UnrollLoops().mutate(s);
+    // Unrolling duplicates variable names. Other passes assume variable names are unique.
+    return uniquify_variable_names(stmt);
 }
 
 }  // namespace Internal

@@ -57,9 +57,9 @@ public:
     }
 
     void clear() {
-        for (size_t i = 0; i < entries.size(); i++) {
-            entries[i].a = Expr();
-            entries[i].b = Expr();
+        for (auto &entry : entries) {
+            entry.a = Expr();
+            entry.b = Expr();
         }
     }
 
@@ -114,6 +114,12 @@ bool equal(const Expr &a, const Expr &b);
 bool equal(const Stmt &a, const Stmt &b);
 bool graph_equal(const Expr &a, const Expr &b);
 bool graph_equal(const Stmt &a, const Stmt &b);
+// @}
+
+/** Order unsanitized IRNodes for use in a map key */
+// @{
+bool graph_less_than(const Expr &a, const Expr &b);
+bool graph_less_than(const Stmt &a, const Stmt &b);
 // @}
 
 void ir_equality_test();

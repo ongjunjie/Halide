@@ -3,14 +3,8 @@
 
 using namespace Halide;
 
-#ifdef _WIN32
-#define DLLEXPORT __declspec(dllexport)
-#else
-#define DLLEXPORT
-#endif
-
 int call_count[4];
-extern "C" DLLEXPORT int call_counter(int x, int idx) {
+extern "C" HALIDE_EXPORT_SYMBOL int call_counter(int x, int idx) {
     call_count[idx]++;
     return x;
 }
@@ -27,7 +21,7 @@ void check_counts(int a = 0, int b = 0, int c = 0, int d = 0) {
     for (int i = 0; i < 4; i++) {
         if (correct[i] != call_count[i]) {
             printf("call_count[%d] was supposed to be %d but instead is %d\n", i, correct[i], call_count[i]);
-            exit(-1);
+            exit(1);
         }
     }
 }

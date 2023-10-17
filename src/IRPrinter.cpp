@@ -5,9 +5,11 @@
 
 #include "AssociativeOpsTable.h"
 #include "Associativity.h"
+#include "Closure.h"
 #include "IROperator.h"
 #include "Module.h"
 #include "Target.h"
+#include "Util.h"
 
 namespace Halide {
 
@@ -28,11 +30,8 @@ ostream &operator<<(ostream &out, const Type &type) {
         out << "float";
         break;
     case Type::Handle:
-        if (type.handle_type) {
-            out << "(" << type.handle_type->inner_name.name << " *)";
-        } else {
-            out << "(void *)";
-        }
+        // ensure that 'const' (etc) qualifiers are emitted when appropriate
+        out << "(" << type_to_c_type(type, false) << ")";
         break;
     case Type::BFloat:
         out << "bfloat";
@@ -58,7 +57,17 @@ ostream &operator<<(ostream &stream, const Expr &ir) {
 }
 
 ostream &operator<<(ostream &stream, const Buffer<> &buffer) {
-    return stream << "buffer " << buffer.name() << " = {...}\n";
+    bool include_data = Internal::ends_with(buffer.name(), "_gpu_source_kernels");
+    stream << "buffer " << buffer.name() << " = {";
+    if (include_data) {
+        std::string str((const char *)buffer.data(), buffer.size_in_bytes());
+        stream << "\n"
+               << str << "\n";
+    } else {
+        stream << "...";
+    }
+    stream << "}\n";
+    return stream;
 }
 
 ostream &operator<<(ostream &stream, const Module &m) {
@@ -105,6 +114,12 @@ ostream &operator<<(ostream &out, const DeviceAPI &api) {
     case DeviceAPI::D3D12Compute:
         out << "<D3D12Compute>";
         break;
+    case DeviceAPI::Vulkan:
+        out << "<Vulkan>";
+        break;
+    case DeviceAPI::WebGPU:
+        out << "<WebGPU>";
+        break;
     }
     return out;
 }
@@ -135,6 +150,9 @@ std::ostream &operator<<(std::ostream &out, const MemoryType &t) {
     case MemoryType::VTCM:
         out << "VTCM";
         break;
+    case MemoryType::AMXTile:
+        out << "AMXTile";
+        break;
     }
     return out;
 }
@@ -149,6 +167,12 @@ std::ostream &operator<<(std::ostream &out, const TailStrategy &t) {
         break;
     case TailStrategy::Predicate:
         out << "Predicate";
+        break;
+    case TailStrategy::PredicateLoads:
+        out << "PredicateLoads";
+        break;
+    case TailStrategy::PredicateStores:
+        out << "PredicateStores";
         break;
     case TailStrategy::ShiftInwards:
         out << "ShiftInwards";
@@ -345,6 +369,9 @@ ostream &operator<<(ostream &stream, const LoweredFunc &function) {
 
 std::ostream &operator<<(std::ostream &stream, const LinkageType &type) {
     switch (type) {
+    case LinkageType::ExternalPlusArgv:
+        stream << "external_plus_argv";
+        break;
     case LinkageType::ExternalPlusMetadata:
         stream << "external_plus_metadata";
         break;
@@ -376,6 +403,27 @@ std::ostream &operator<<(std::ostream &out, const DimType &t) {
     case DimType::ImpureRVar:
         out << "ImpureRVar";
         break;
+    }
+    return out;
+}
+
+std::ostream &operator<<(std::ostream &out, const Closure &c) {
+    for (const auto &v : c.vars) {
+        out << "var: " << v.first << "\n";
+    }
+    for (const auto &b : c.buffers) {
+        out << "buffer: " << b.first << " " << b.second.size;
+        if (b.second.read) {
+            out << " (read)";
+        }
+        if (b.second.write) {
+            out << " (write)";
+        }
+        if (b.second.memory_type == MemoryType::GPUTexture) {
+            out << " <texture>";
+        }
+        out << " dims=" << (int)b.second.dimensions;
+        out << "\n";
     }
     return out;
 }
@@ -438,8 +486,7 @@ void IRPrinter::visit(const FloatImm *op) {
 
 void IRPrinter::visit(const StringImm *op) {
     stream << "\"";
-    for (size_t i = 0; i < op->value.size(); i++) {
-        unsigned char c = op->value[i];
+    for (unsigned char c : op->value) {
         if (c >= ' ' && c <= '~' && c != '\\' && c != '"') {
             stream << c;
         } else {
@@ -471,6 +518,12 @@ void IRPrinter::visit(const StringImm *op) {
 
 void IRPrinter::visit(const Cast *op) {
     stream << op->type << "(";
+    print(op->value);
+    stream << ")";
+}
+
+void IRPrinter::visit(const Reinterpret *op) {
+    stream << "reinterpret<" << op->type << ">(";
     print(op->value);
     stream << ")";
 }
@@ -805,7 +858,16 @@ void IRPrinter::visit(const Store *op) {
 }
 
 void IRPrinter::visit(const Provide *op) {
-    stream << get_indent() << op->name << "(";
+    stream << get_indent();
+    const bool has_pred = !is_const_one(op->predicate);
+    if (has_pred) {
+        stream << "predicate (";
+        print_no_parens(op->predicate);
+        stream << ")\n";
+        indent++;
+        stream << get_indent();
+    }
+    stream << op->name << "(";
     print_list(op->args);
     stream << ") = ";
     if (op->values.size() > 1) {
@@ -817,14 +879,25 @@ void IRPrinter::visit(const Provide *op) {
     }
 
     stream << "\n";
+    if (has_pred) {
+        indent--;
+    }
 }
 
 void IRPrinter::visit(const Allocate *op) {
     ScopedBinding<> bind(known_type, op->name);
     stream << get_indent() << "allocate " << op->name << "[" << op->type;
-    for (size_t i = 0; i < op->extents.size(); i++) {
+    bool first = true;
+    for (const auto &extent : op->extents) {
         stream << " * ";
-        print(op->extents[i]);
+        if (first && op->padding) {
+            stream << "(";
+            first = false;
+        }
+        print(extent);
+    }
+    if (op->padding) {
+        stream << " + " << op->padding << ")";
     }
     stream << "]";
     if (op->memory_type != MemoryType::Auto) {
@@ -893,7 +966,7 @@ void IRPrinter::visit(const Prefetch *op) {
         indent++;
         stream << get_indent();
     }
-    stream << "prefetch " << op->name << "(";
+    stream << "prefetch " << op->name << ", " << op->prefetch.at << ", " << op->prefetch.from << ", (";
     for (size_t i = 0; i < op->bounds.size(); i++) {
         stream << "[";
         print_no_parens(op->bounds[i].min);

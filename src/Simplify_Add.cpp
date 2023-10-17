@@ -9,21 +9,12 @@ Expr Simplify::visit(const Add *op, ExprInfo *bounds) {
     Expr b = mutate(op->b, &b_bounds);
 
     if (bounds && no_overflow_int(op->type)) {
-        bounds->min_defined = a_bounds.min_defined && b_bounds.min_defined;
-        bounds->max_defined = a_bounds.max_defined && b_bounds.max_defined;
-        if (add_would_overflow(64, a_bounds.min, b_bounds.min)) {
-            bounds->min_defined = false;
-            bounds->min = 0;
-        } else {
-            bounds->min = a_bounds.min + b_bounds.min;
-        }
-        if (add_would_overflow(64, a_bounds.max, b_bounds.max)) {
-            bounds->max_defined = false;
-            bounds->max = 0;
-        } else {
-            bounds->max = a_bounds.max + b_bounds.max;
-        }
-
+        bounds->min_defined = a_bounds.min_defined &&
+                              b_bounds.min_defined &&
+                              add_with_overflow(64, a_bounds.min, b_bounds.min, &(bounds->min));
+        bounds->max_defined = a_bounds.max_defined &&
+                              b_bounds.max_defined &&
+                              add_with_overflow(64, a_bounds.max, b_bounds.max, &(bounds->max));
         bounds->alignment = a_bounds.alignment + b_bounds.alignment;
         bounds->trim_bounds_using_alignment();
     }
@@ -38,8 +29,7 @@ Expr Simplify::visit(const Add *op, ExprInfo *bounds) {
 
         auto rewrite = IRMatcher::rewriter(IRMatcher::add(a, b), op->type);
 
-        if (rewrite(c0 + c1, fold(c0 + c1)) ||
-            rewrite(IRMatcher::Overflow() + x, a) ||
+        if (rewrite(IRMatcher::Overflow() + x, a) ||
             rewrite(x + IRMatcher::Overflow(), b) ||
             rewrite(x + 0, x) ||
             rewrite(0 + x, x)) {
@@ -48,7 +38,8 @@ Expr Simplify::visit(const Add *op, ExprInfo *bounds) {
 
         // clang-format off
         if (EVAL_IN_LAMBDA
-            (rewrite(x + x, x * 2) ||
+            (rewrite(c0 + c1, fold(c0 + c1)) ||
+             rewrite(x + x, x * 2) ||
              rewrite(ramp(x, y, c0) + ramp(z, w, c0), ramp(x + z, y + w, c0)) ||
              rewrite(ramp(x, y, c0) + broadcast(z, c0), ramp(x + z, y, c0)) ||
              rewrite(broadcast(x, c0) + broadcast(y, c1), broadcast(x + broadcast(y, fold(c1/c0)), c0), c1 % c0 == 0) ||
@@ -74,6 +65,9 @@ Expr Simplify::visit(const Add *op, ExprInfo *bounds) {
              rewrite(select(x, y, z) + (w + select(x, u, v)), select(x, y + u, z + v) + w) ||
              rewrite(select(x, y, z) + (select(x, u, v) - w), select(x, y + u, z + v) - w) ||
              rewrite(select(x, y, z) + (w - select(x, u, v)), select(x, y - u, z - v) + w) ||
+             rewrite(select(x, c0 - y, c1) + c2, select(x, fold(c0 + c2) - y, fold(c1 + c2))) ||
+             rewrite(select(x, y, z + c0) + c1, select(x, y + c1, z), (c0 + c1) == 0) ||
+             rewrite(select(x, c0 - y, c1) + c2, fold(c0 + c2) - select(x, y, fold(c0 - c1))) ||
 
              rewrite(x + y*(-1), x - y) ||
              rewrite(x*(-1) + y, y - x) ||
@@ -83,6 +77,7 @@ Expr Simplify::visit(const Add *op, ExprInfo *bounds) {
              rewrite(x + (y + c0), (x + y) + c0) ||
              rewrite((c0 - x) + c1, fold(c0 + c1) - x) ||
              rewrite((c0 - x) + y, (y - x) + c0) ||
+             rewrite(max(x, y*c0 + z) + (u - y)*c0, max(x - y*c0, z) + u*c0) ||
 
              rewrite((x - y) + y, x) ||
              rewrite(x + (y - x), y) ||
@@ -117,6 +112,16 @@ Expr Simplify::visit(const Add *op, ExprInfo *bounds) {
              rewrite(y*x + y*z, y*(x + z)) ||
              rewrite(x*c0 + y*c1, (x + y*fold(c1/c0)) * c0, c1 % c0 == 0) ||
              rewrite(x*c0 + y*c1, (x*fold(c0/c1) + y) * c1, c0 % c1 == 0) ||
+
+             // Hoist shuffles. The Shuffle visitor wants to sink
+             // extract_elements to the leaves, and those count as degenerate
+             // slices, so only hoist shuffles that grab more than one lane.
+             rewrite(slice(x, c0, c1, c2) + slice(y, c0, c1, c2), slice(x + y, c0, c1, c2), c2 > 1 && lanes_of(x) == lanes_of(y)) ||
+             rewrite(slice(x, c0, c1, c2) + (z + slice(y, c0, c1, c2)), slice(x + y, c0, c1, c2) + z, c2 > 1 && lanes_of(x) == lanes_of(y)) ||
+             rewrite(slice(x, c0, c1, c2) + (slice(y, c0, c1, c2) + z), slice(x + y, c0, c1, c2) + z, c2 > 1 && lanes_of(x) == lanes_of(y)) ||
+             rewrite(slice(x, c0, c1, c2) + (z - slice(y, c0, c1, c2)), slice(x - y, c0, c1, c2) + z, c2 > 1 && lanes_of(x) == lanes_of(y)) ||
+             rewrite(slice(x, c0, c1, c2) + (slice(y, c0, c1, c2) - z), slice(x + y, c0, c1, c2) - z, c2 > 1 && lanes_of(x) == lanes_of(y)) ||
+
              (no_overflow(op->type) &&
               (rewrite(x + x*y, x * (y + 1)) ||
                rewrite(x + y*x, (y + 1) * x) ||
@@ -192,18 +197,6 @@ Expr Simplify::visit(const Add *op, ExprInfo *bounds) {
             return mutate(rewrite.result, bounds);
         }
         // clang-format on
-
-        const Shuffle *shuffle_a = a.as<Shuffle>();
-        const Shuffle *shuffle_b = b.as<Shuffle>();
-        if (shuffle_a && shuffle_b &&
-            shuffle_a->is_slice() &&
-            shuffle_b->is_slice()) {
-            if (a.same_as(op->a) && b.same_as(op->b)) {
-                return hoist_slice_vector<Add>(op);
-            } else {
-                return hoist_slice_vector<Add>(Add::make(a, b));
-            }
-        }
     }
 
     if (a.same_as(op->a) && b.same_as(op->b)) {

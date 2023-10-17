@@ -105,10 +105,10 @@ ConstantInterval add(const ConstantInterval &a, const ConstantInterval &b) {
     result.min_defined = a.has_lower_bound() && b.has_lower_bound();
     result.max_defined = a.has_upper_bound() && b.has_upper_bound();
     if (result.has_lower_bound()) {
-        result.min = a.min + b.min;
+        result.min_defined = add_with_overflow(64, a.min, b.min, &result.min);
     }
     if (result.has_upper_bound()) {
-        result.max = a.max + b.max;
+        result.max_defined = add_with_overflow(64, a.max, b.max, &result.max);
     }
     return result;
 }
@@ -120,14 +120,27 @@ ConstantInterval add(const ConstantInterval &a, int64_t b) {
 ConstantInterval negate(const ConstantInterval &r) {
     ConstantInterval result;
     result.min_defined = r.has_upper_bound();
-    result.min = r.has_upper_bound() ? -r.max : 0;
+    if (result.min_defined) {
+        result.min_defined = sub_with_overflow(64, 0, r.max, &result.min);
+    }
     result.max_defined = r.has_lower_bound();
-    result.max = r.has_lower_bound() ? -r.min : 0;
+    if (result.max_defined) {
+        result.max_defined = sub_with_overflow(64, 0, r.min, &result.max);
+    }
     return result;
 }
 
 ConstantInterval sub(const ConstantInterval &a, const ConstantInterval &b) {
-    return add(a, negate(b));
+    ConstantInterval result;
+    result.min_defined = a.has_lower_bound() && b.has_lower_bound();
+    result.max_defined = a.has_upper_bound() && b.has_upper_bound();
+    if (result.has_lower_bound()) {
+        result.min_defined = sub_with_overflow(64, a.min, b.max, &result.min);
+    }
+    if (result.has_upper_bound()) {
+        result.max_defined = sub_with_overflow(64, a.max, b.min, &result.max);
+    }
+    return result;
 }
 
 ConstantInterval sub(const ConstantInterval &a, int64_t b) {
@@ -160,19 +173,20 @@ ConstantInterval multiply(const ConstantInterval &a, const ConstantInterval &b) 
     int64_t bounds[4];
     int64_t *bounds_begin = &bounds[0];
     int64_t *bounds_end = &bounds[0];
+    bool no_overflow = true;
     if (a.has_lower_bound() && b.has_lower_bound()) {
-        *bounds_end++ = a.min * b.min;
+        no_overflow = no_overflow && mul_with_overflow(64, a.min, b.min, bounds_end++);
     }
     if (a.has_lower_bound() && b.has_upper_bound()) {
-        *bounds_end++ = a.min * b.max;
+        no_overflow = no_overflow && mul_with_overflow(64, a.min, b.max, bounds_end++);
     }
     if (a.has_upper_bound() && b.has_lower_bound()) {
-        *bounds_end++ = a.max * b.min;
+        no_overflow = no_overflow && mul_with_overflow(64, a.max, b.min, bounds_end++);
     }
     if (a.has_upper_bound() && b.has_upper_bound()) {
-        *bounds_end++ = a.max * b.max;
+        no_overflow = no_overflow && mul_with_overflow(64, a.max, b.max, bounds_end++);
     }
-    if (bounds_begin != bounds_end) {
+    if (no_overflow && (bounds_begin != bounds_end)) {
         ConstantInterval result = {
             *std::min_element(bounds_begin, bounds_end),
             *std::max_element(bounds_begin, bounds_end),
@@ -211,7 +225,7 @@ ConstantInterval divide(const ConstantInterval &a, int64_t b) {
         result.min = div_imp(result.min, b);
     }
     if (result.has_upper_bound()) {
-        result.max = div_imp(result.max + b - 1, b);
+        result.max = div_imp(result.max - 1, b) + 1;
     }
     return result;
 }
@@ -257,6 +271,10 @@ class DerivativeBounds : public IRVisitor {
         if (!is_constant(result)) {
             result = ConstantInterval::everything();
         }
+    }
+
+    void visit(const Reinterpret *op) override {
+        result = ConstantInterval::everything();
     }
 
     void visit(const Variable *op) override {
@@ -428,25 +446,24 @@ class DerivativeBounds : public IRVisitor {
             ConstantInterval ra = result;
             op->false_value.accept(this);
             ConstantInterval rb = result;
-            ConstantInterval unified = unify(ra, rb);
+            result = unify(ra, rb);
 
-            // TODO: How to handle unsigned values?
-            Expr delta = simplify(op->true_value - op->false_value);
+            // If the condition is not constant, we hit a "bump" when the condition changes value.
+            if (!is_constant(rcond)) {
+                // TODO: How to handle unsigned values?
+                Expr delta = simplify(op->true_value - op->false_value);
 
-            Interval delta_bounds = find_constant_bounds(delta, bounds);
-            ConstantInterval adjusted_delta;
-            // TODO: Maybe we can do something with one-sided intervals?
-            if (delta_bounds.is_bounded()) {
-                ConstantInterval delta_low = multiply(rcond, delta_bounds.min);
-                ConstantInterval delta_high = multiply(rcond, delta_bounds.max);
-                adjusted_delta = ConstantInterval::make_union(delta_low, delta_high);
-            } else {
-                delta.accept(this);
-                ConstantInterval rdelta = result;
-                adjusted_delta = multiply(rcond, rdelta);
+                Interval delta_bounds = find_constant_bounds(delta, bounds);
+                // TODO: Maybe we can do something with one-sided intervals?
+                if (delta_bounds.is_bounded()) {
+                    ConstantInterval delta_low = multiply(rcond, delta_bounds.min);
+                    ConstantInterval delta_high = multiply(rcond, delta_bounds.max);
+                    result = add(result, ConstantInterval::make_union(delta_low, delta_high));
+                } else {
+                    // The bump is unbounded.
+                    result = ConstantInterval::everything();
+                }
             }
-
-            result = add(unified, adjusted_delta);
         } else {
             result = ConstantInterval::everything();
         }
@@ -477,7 +494,8 @@ class DerivativeBounds : public IRVisitor {
         }
 
         if (op->is_intrinsic(Call::unsafe_promise_clamped) ||
-            op->is_intrinsic(Call::promise_clamped)) {
+            op->is_intrinsic(Call::promise_clamped) ||
+            op->is_intrinsic(Call::saturating_cast)) {
             op->args[0].accept(this);
             return;
         }
@@ -494,8 +512,8 @@ class DerivativeBounds : public IRVisitor {
             return;
         }
 
-        for (size_t i = 0; i < op->args.size(); i++) {
-            op->args[i].accept(this);
+        for (const auto &arg : op->args) {
+            arg.accept(this);
             if (!is_constant(result)) {
                 // One of the args is not constant.
                 result = ConstantInterval::everything();
@@ -521,8 +539,8 @@ class DerivativeBounds : public IRVisitor {
     }
 
     void visit(const Shuffle *op) override {
-        for (size_t i = 0; i < op->vectors.size(); i++) {
-            op->vectors[i].accept(this);
+        for (const auto &vector : op->vectors) {
+            vector.accept(this);
             if (!is_constant(result)) {
                 result = ConstantInterval::everything();
                 return;
@@ -632,7 +650,7 @@ ConstantInterval derivative_bounds(const Expr &e, const std::string &var, const 
         return ConstantInterval::everything();
     }
     DerivativeBounds m(var, scope);
-    e.accept(&m);
+    remove_likelies(remove_promises(e)).accept(&m);
     return m.result;
 }
 
@@ -680,6 +698,7 @@ void is_monotonic_test() {
 
     Expr x = Variable::make(Int(32), "x");
     Expr y = Variable::make(Int(32), "y");
+    Expr z = Variable::make(Int(32), "z");
 
     check_increasing(x);
     check_increasing(x + 4);
@@ -723,6 +742,10 @@ void is_monotonic_test() {
 
     check_unknown(select(x < 2, x, x - 5));
     check_unknown(select(x > 2, x - 5, x));
+
+    check_unknown(select(x > 0, y, z));
+
+    check_increasing(select(0 < x, promise_clamped(x - 1, x - 1, z) + 1, promise_clamped(x, x, z)));
 
     check_constant(y);
 

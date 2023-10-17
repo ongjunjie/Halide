@@ -2,7 +2,6 @@
 #include <sstream>
 #include <utility>
 
-#include "CodeGen_C.h"
 #include "CodeGen_GPU_Dev.h"
 #include "CodeGen_Internal.h"
 #include "CodeGen_Metal_Dev.h"
@@ -49,18 +48,22 @@ public:
         return "metal";
     }
 
+    bool kernel_run_takes_types() const override {
+        return true;
+    }
+
 protected:
-    class CodeGen_Metal_C : public CodeGen_C {
+    class CodeGen_Metal_C : public CodeGen_GPU_C {
     public:
         CodeGen_Metal_C(std::ostream &s, const Target &t)
-            : CodeGen_C(s, t) {
+            : CodeGen_GPU_C(s, t) {
         }
         void add_kernel(const Stmt &stmt,
                         const std::string &name,
                         const std::vector<DeviceArgument> &args);
 
     protected:
-        using CodeGen_C::visit;
+        using CodeGen_GPU_C::visit;
         std::string print_type(Type type, AppendSpaceIfNeeded space_option = DoNotAppendSpace) override;
         // Vectors in Metal come in two varieties, regular and packed.
         // For storage allocations and pointers used in address arithmetic,
@@ -92,6 +95,7 @@ protected:
         void visit(const Allocate *op) override;
         void visit(const Free *op) override;
         void visit(const Cast *op) override;
+        void visit(const VectorReduce *op) override;
         void visit(const Atomic *op) override;
     };
 
@@ -206,7 +210,7 @@ string simt_intrinsic(const string &name) {
 }  // namespace
 
 string CodeGen_Metal_Dev::CodeGen_Metal_C::print_extern_call(const Call *op) {
-    internal_assert(!function_takes_user_context(op->name));
+    internal_assert(!function_takes_user_context(op->name)) << op->name;
     vector<string> args(op->args.size());
     for (size_t i = 0; i < op->args.size(); i++) {
         args[i] = print_expr(op->args[i]);
@@ -222,6 +226,20 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::visit(const Max *op) {
 
 void CodeGen_Metal_Dev::CodeGen_Metal_C::visit(const Min *op) {
     print_expr(Call::make(op->type, "min", {op->a, op->b}, Call::Extern));
+}
+
+void CodeGen_Metal_Dev::CodeGen_Metal_C::visit(const VectorReduce *op) {
+    if (op->op == VectorReduce::Add && op->type.is_float() && (op->type.lanes() == 1)) {
+        if (const Mul *maybe_mul = op->value.as<Mul>()) {
+            string a = print_expr(maybe_mul->a);
+            string b = print_expr(maybe_mul->b);
+            ostringstream rhs;
+            rhs << "dot(" << a << ", " << b << ")";
+            print_assignment(op->type, rhs.str());
+            return;
+        }
+    }
+    CodeGen_GPU_C::visit(op);
 }
 
 void CodeGen_Metal_Dev::CodeGen_Metal_C::visit(const Div *op) {
@@ -267,7 +285,7 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::visit(const For *loop) {
 
     } else {
         user_assert(loop->for_type != ForType::Parallel) << "Cannot use parallel loops inside Metal kernel\n";
-        CodeGen_C::visit(loop);
+        CodeGen_GPU_C::visit(loop);
     }
 }
 
@@ -321,7 +339,7 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::visit(const Call *op) {
         stream << ");\n";
         print_assignment(op->type, "0");
     } else {
-        CodeGen_C::visit(op);
+        CodeGen_GPU_C::visit(op);
     }
 }
 
@@ -549,6 +567,13 @@ void CodeGen_Metal_Dev::add_kernel(Stmt s,
                                    const vector<DeviceArgument> &args) {
     debug(2) << "CodeGen_Metal_Dev::compile " << name << "\n";
 
+    // We need to scalarize/de-predicate any loads/stores, since Metal does not
+    // support predication.
+    s = scalarize_predicated_loads_stores(s);
+
+    debug(2) << "CodeGen_Metal_Dev: after removing predication: \n"
+             << s;
+
     // TODO: do we have to uniquify these names, or can we trust that they are safe?
     cur_kernel_name = name;
     metal_c.add_kernel(s, name, args);
@@ -586,11 +611,11 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::add_kernel(const Stmt &s,
     // The last condition is handled via the preprocessor in the kernel
     // declaration.
     vector<BufferSize> constants;
-    for (size_t i = 0; i < args.size(); i++) {
-        if (args[i].is_buffer &&
-            CodeGen_GPU_Dev::is_buffer_constant(s, args[i].name) &&
-            args[i].size > 0) {
-            constants.emplace_back(args[i].name, args[i].size);
+    for (const auto &arg : args) {
+        if (arg.is_buffer &&
+            CodeGen_GPU_Dev::is_buffer_constant(s, arg.name) &&
+            arg.size > 0) {
+            constants.emplace_back(arg.name, arg.size);
         }
     }
 
@@ -607,38 +632,38 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::add_kernel(const Stmt &s,
 
     // Create preprocessor replacements for the address spaces of all our buffers.
     stream << "// Address spaces for " << name << "\n";
-    for (size_t i = 0; i < args.size(); i++) {
-        if (args[i].is_buffer) {
+    for (const auto &arg : args) {
+        if (arg.is_buffer) {
             vector<BufferSize>::iterator constant = constants.begin();
             while (constant != constants.end() &&
-                   constant->name != args[i].name) {
+                   constant->name != arg.name) {
                 constant++;
             }
 
             if (constant != constants.end()) {
                 stream << "#if " << constant->size << " < MAX_CONSTANT_BUFFER_SIZE && "
                        << constant - constants.begin() << " < MAX_CONSTANT_ARGS\n";
-                stream << "#define " << get_memory_space(args[i].name) << " constant\n";
+                stream << "#define " << get_memory_space(arg.name) << " constant\n";
                 stream << "#else\n";
-                stream << "#define " << get_memory_space(args[i].name) << " device\n";
+                stream << "#define " << get_memory_space(arg.name) << " device\n";
                 stream << "#endif\n";
             } else {
-                stream << "#define " << get_memory_space(args[i].name) << " device\n";
+                stream << "#define " << get_memory_space(arg.name) << " device\n";
             }
         }
     }
 
     // Emit a struct to hold the scalar args of the kernel
     bool any_scalar_args = false;
-    for (size_t i = 0; i < args.size(); i++) {
-        if (!args[i].is_buffer) {
+    for (const auto &arg : args) {
+        if (!arg.is_buffer) {
             if (!any_scalar_args) {
                 stream << "struct " + name + "_args {\n";
                 any_scalar_args = true;
             }
-            stream << print_type(args[i].type)
+            stream << print_type(arg.type)
                    << " "
-                   << print_name(args[i].name)
+                   << print_name(arg.name)
                    << ";\n";
         }
     }
@@ -656,18 +681,18 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::add_kernel(const Stmt &s,
         buffer_index++;
     }
 
-    for (size_t i = 0; i < args.size(); i++) {
-        if (args[i].is_buffer) {
+    for (const auto &arg : args) {
+        if (arg.is_buffer) {
             stream << ",\n";
-            stream << " " << get_memory_space(args[i].name) << " ";
-            if (!args[i].write) {
+            stream << " " << get_memory_space(arg.name) << " ";
+            if (!arg.write) {
                 stream << "const ";
             }
-            stream << print_storage_type(args[i].type) << " *"
-                   << print_name(args[i].name) << " [[ buffer(" << buffer_index++ << ") ]]";
+            stream << print_storage_type(arg.type) << " *"
+                   << print_name(arg.name) << " [[ buffer(" << buffer_index++ << ") ]]";
             Allocation alloc;
-            alloc.type = args[i].type;
-            allocations.push(args[i].name, alloc);
+            alloc.type = arg.type;
+            allocations.push(arg.name, alloc);
         }
     }
 
@@ -701,12 +726,12 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::add_kernel(const Stmt &s,
     open_scope();
 
     // Unpack args struct into local variables to match naming of generated code.
-    for (size_t i = 0; i < args.size(); i++) {
-        if (!args[i].is_buffer) {
-            stream << print_type(args[i].type)
+    for (const auto &arg : args) {
+        if (!arg.is_buffer) {
+            stream << print_type(arg.type)
                    << " "
-                   << print_name(args[i].name)
-                   << " = _scalar_args->" << print_name(args[i].name)
+                   << print_name(arg.name)
+                   << " = _scalar_args->" << print_name(arg.name)
                    << ";\n";
         }
     }
@@ -714,17 +739,17 @@ void CodeGen_Metal_Dev::CodeGen_Metal_C::add_kernel(const Stmt &s,
     print(s);
     close_scope("kernel " + name);
 
-    for (size_t i = 0; i < args.size(); i++) {
+    for (const auto &arg : args) {
         // Remove buffer arguments from allocation scope
-        if (args[i].is_buffer) {
-            allocations.pop(args[i].name);
+        if (arg.is_buffer) {
+            allocations.pop(arg.name);
         }
     }
 
     // Undef all the buffer address spaces, in case they're different in another kernel.
-    for (size_t i = 0; i < args.size(); i++) {
-        if (args[i].is_buffer) {
-            stream << "#undef " << get_memory_space(args[i].name) << "\n";
+    for (const auto &arg : args) {
+        if (arg.is_buffer) {
+            stream << "#undef " << get_memory_space(arg.name) << "\n";
         }
     }
 }
@@ -757,7 +782,6 @@ void CodeGen_Metal_Dev::init_module() {
                << "#define abs_f32 fabs\n"
                << "#define floor_f32 floor\n"
                << "#define ceil_f32 ceil\n"
-               << "#define round_f32 round\n"
                << "#define trunc_f32 trunc\n"
                << "#define pow_f32 pow\n"
                << "#define asin_f32 asin\n"
@@ -782,7 +806,7 @@ void CodeGen_Metal_Dev::init_module() {
                << "#endif\n"
                << "}\n";  // close namespace
 
-    src_stream << "#define halide_unused(x) (void)(x)\n";
+    src_stream << "#define halide_maybe_unused(x) (void)(x)\n";
 
     src_stream << "\n";
 

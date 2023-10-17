@@ -13,7 +13,7 @@ void reset_trace() {
 }
 
 // A trace that checks for vector and scalar stores
-int my_trace(void *user_context, const halide_trace_event_t *ev) {
+int my_trace(JITUserContext *user_context, const halide_trace_event_t *ev) {
 
     if (ev->event == halide_trace_store) {
         if (ev->type.lanes > 1) {
@@ -33,7 +33,7 @@ void reset_alloc_counts() {
     empty_allocs = nonempty_allocs = frees = 0;
 }
 
-void *my_malloc(void *ctx, size_t sz) {
+void *my_malloc(JITUserContext *ctx, size_t sz) {
     // Don't worry about alignment because we'll just test this with scalar code
     if (sz == 0) {
         empty_allocs++;
@@ -43,7 +43,7 @@ void *my_malloc(void *ctx, size_t sz) {
     return malloc(sz);
 }
 
-void my_free(void *ctx, void *ptr) {
+void my_free(JITUserContext *ctx, void *ptr) {
     frees++;
     free(ptr);
 }
@@ -77,7 +77,7 @@ public:
 
 int main(int argc, char **argv) {
     if (get_jit_target_from_environment().arch == Target::WebAssembly) {
-        printf("[SKIP] WebAssembly JIT does not support set_custom_allocator().\n");
+        printf("[SKIP] WebAssembly JIT does not support custom allocators.\n");
         return 0;
     }
 
@@ -102,7 +102,7 @@ int main(int argc, char **argv) {
         // Now specialize the narrow case on param as well
         f.specialize(param);
 
-        f.set_custom_trace(&my_trace);
+        f.jit_handlers().custom_trace = my_trace;
         f.trace_stores();
 
         Buffer<int> out(100);
@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
         // Should have used vector stores
         if (!vector_store || scalar_store) {
             printf("This was supposed to use vector stores\n");
-            return -1;
+            return 1;
         }
 
         // Now try a smaller input
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
         // Should have used scalar stores
         if (vector_store || !scalar_store) {
             printf("This was supposed to use scalar stores\n");
-            return -1;
+            return 1;
         }
     }
 
@@ -190,7 +190,8 @@ int main(int argc, char **argv) {
         out.specialize(param);
 
         // Count allocations.
-        out.set_custom_allocator(&my_malloc, &my_free);
+        out.jit_handlers().custom_malloc = my_malloc;
+        out.jit_handlers().custom_free = my_free;
 
         reset_alloc_counts();
         param.set(true);
@@ -200,7 +201,7 @@ int main(int argc, char **argv) {
             printf("There were supposed to be 1 empty alloc, 2 nonempty allocs, and 3 frees.\n"
                    "Instead we got %d empty allocs, %d nonempty allocs, and %d frees.\n",
                    empty_allocs, nonempty_allocs, frees);
-            return -1;
+            return 1;
         }
 
         reset_alloc_counts();
@@ -211,13 +212,13 @@ int main(int argc, char **argv) {
             printf("There were supposed to be 2 empty allocs, 1 nonempty alloc, and 3 frees.\n"
                    "Instead we got %d empty allocs, %d nonempty allocs, and %d frees.\n",
                    empty_allocs, nonempty_allocs, frees);
-            return -1;
+            return 1;
         }
     }
 
     {
         // Specialize for interleaved vs planar inputs
-        ImageParam im(Float(32), 1);
+        ImageParam im(Int(32), 1);
         im.dim(0).set_stride(Expr());  // unconstrain the stride
 
         Func f;
@@ -229,14 +230,14 @@ int main(int argc, char **argv) {
         f.specialize(im.dim(0).stride() == 1 && im.width() >= 8).vectorize(x, 8);
 
         f.trace_stores();
-        f.set_custom_trace(&my_trace);
+        f.jit_handlers().custom_trace = &my_trace;
 
         // Check bounds inference is still cool with widths < 8
         f.infer_input_bounds({5});
         int m = im.get().min(0), e = im.get().extent(0);
         if (m != 0 || e != 5) {
             printf("min, extent = %d, %d instead of 0, 5\n", m, e);
-            return -1;
+            return 1;
         }
 
         // Check we don't crash with the small input, and that it uses scalar stores
@@ -244,24 +245,63 @@ int main(int argc, char **argv) {
         f.realize({5});
         if (!scalar_store || vector_store) {
             printf("These stores were supposed to be scalar.\n");
-            return -1;
+            return 1;
         }
 
         // Check we don't crash with a larger input, and that it uses vector stores
-        Buffer<float> image(100);
+        Buffer<int> image(100);
         im.set(image);
 
         reset_trace();
         f.realize({100});
         if (scalar_store || !vector_store) {
             printf("These stores were supposed to be vector.\n");
-            return -1;
+            return 1;
+        }
+    }
+
+    {
+        // Specialize a copy for dense vs. non-dense inputs.
+        ImageParam im(Int(32), 1);
+        im.dim(0).set_stride(Expr());  // unconstrain the stride
+
+        Func f;
+        Var x;
+
+        f(x) = im(x);
+
+        f.specialize(im.dim(0).stride() == 1).vectorize(x, 8);
+
+        f.trace_stores();
+        f.jit_handlers().custom_trace = &my_trace;
+
+        Buffer<int> strided_image(4, 100);
+        strided_image.slice(0, 0);
+        im.set(strided_image);
+
+        // Check we used scalar stores for a strided input.
+        reset_trace();
+        f.realize({100});
+        if (!scalar_store || vector_store) {
+            printf("These stores were supposed to be scalar.\n");
+            return 1;
+        }
+
+        // Check that we used vector stores for a dense input.
+        Buffer<int> image(100);
+        im.set(image);
+
+        reset_trace();
+        f.realize({100});
+        if (scalar_store || !vector_store) {
+            printf("These stores were supposed to be vector.\n");
+            return 1;
         }
     }
 
     {
         // Bounds required of the input change depending on the param
-        ImageParam im(Float(32), 1);
+        ImageParam im(Int(32), 1);
         Param<bool> param;
 
         Func f;
@@ -274,7 +314,7 @@ int main(int argc, char **argv) {
         int m = im.get().min(0);
         if (m != 10) {
             printf("min %d instead of 10\n", m);
-            return -1;
+            return 1;
         }
         param.set(false);
         im.reset();
@@ -282,7 +322,7 @@ int main(int argc, char **argv) {
         m = im.get().min(0);
         if (m != -10) {
             printf("min %d instead of -10\n", m);
-            return -1;
+            return 1;
         }
     }
 
@@ -312,17 +352,17 @@ int main(int argc, char **argv) {
     {
         // What happens to bounds inference if an input is not used at
         // all for a given specialization?
-        ImageParam im(Float(32), 1);
+        ImageParam im(Int(32), 1);
         Param<bool> param;
         Func f;
         Var x;
 
-        f(x) = select(param, im(x), 0.0f);
+        f(x) = select(param, im(x), 0);
 
         f.specialize(param);
 
         param.set(false);
-        Buffer<float> image(10);
+        Buffer<int> image(10);
         im.set(image);
         // The image is too small, but that should be OK, because the
         // param is false so the image will never be used.
@@ -351,14 +391,14 @@ int main(int argc, char **argv) {
 
         if (im.get().extent(0) != 3) {
             printf("extent(0) was supposed to be 3.\n");
-            return -1;
+            return 1;
         }
 
         if (im.get().extent(1) != 2) {
             // Height is 2, because the unrolling also happens in the
             // specialized case.
             printf("extent(1) was supposed to be 2.\n");
-            return -1;
+            return 1;
         }
     }
 
@@ -411,7 +451,7 @@ int main(int argc, char **argv) {
 
         if (if_then_else_count != 1) {
             printf("Expected 1 IfThenElse stmts. Found %d.\n", if_then_else_count);
-            return -1;
+            return 1;
         }
     }
 
@@ -444,7 +484,7 @@ int main(int argc, char **argv) {
         // branch cannot be simplified.
         if (if_then_else_count != 2) {
             printf("Expected 2 IfThenElse stmts. Found %d.\n", if_then_else_count);
-            return -1;
+            return 1;
         }
     }
 
@@ -472,7 +512,7 @@ int main(int argc, char **argv) {
         int h = im.get().height();
         if (w != 10 || h != 1) {
             printf("Incorrect inferred size: %d %d\n", w, h);
-            return -1;
+            return 1;
         }
         im.reset();
 
@@ -482,7 +522,7 @@ int main(int argc, char **argv) {
         h = im.get().height();
         if (w != 1 || h != 10) {
             printf("Incorrect inferred size: %d %d\n", w, h);
-            return -1;
+            return 1;
         }
     }
 
@@ -506,7 +546,7 @@ int main(int argc, char **argv) {
         int h = im.get().height();
         if (w != 10 || h != 1) {
             printf("Incorrect inferred size: %d %d\n", w, h);
-            return -1;
+            return 1;
         }
         im.reset();
 
@@ -521,7 +561,7 @@ int main(int argc, char **argv) {
         h = im.get().height();
         if (w != 10 || h != 10) {
             printf("Incorrect inferred size: %d %d\n", w, h);
-            return -1;
+            return 1;
         }
     }
 
@@ -550,7 +590,7 @@ int main(int argc, char **argv) {
         // should be (something) == 0
         _halide_user_assert(s[0].condition.as<Internal::EQ>() && is_const_zero(s[0].condition.as<Internal::EQ>()->b));
 
-        f.set_custom_trace(&my_trace);
+        f.jit_handlers().custom_trace = &my_trace;
         f.trace_stores();
 
         vector_store_lanes = 0;
@@ -598,7 +638,7 @@ int main(int argc, char **argv) {
         // should be (something) == 0
         _halide_user_assert(s[0].condition.as<Internal::EQ>() && is_const_zero(s[0].condition.as<Internal::EQ>()->b));
 
-        f.set_custom_trace(&my_trace);
+        f.jit_handlers().custom_trace = &my_trace;
         f.trace_stores();
 
         vector_store_lanes = 0;
@@ -625,7 +665,7 @@ int main(int argc, char **argv) {
         f.specialize(p == 0).vectorize(x, 32);  // will *not* be pruned
         f.specialize(const_true).vectorize(x, 16);
 
-        f.set_custom_trace(&my_trace);
+        f.jit_handlers().custom_trace = &my_trace;
         f.trace_stores();
 
         vector_store_lanes = 0;
@@ -655,7 +695,7 @@ int main(int argc, char **argv) {
         // Also not ok to have duplicate specialize_fail() calls.
         // f.specialize_fail("This is bad.");  -- would fail
 
-        f.set_custom_trace(&my_trace);
+        f.jit_handlers().custom_trace = &my_trace;
         f.trace_stores();
 
         vector_store_lanes = 0;

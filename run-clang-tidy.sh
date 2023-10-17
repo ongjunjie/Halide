@@ -8,23 +8,23 @@ ROOT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 
 FIX=$1
 
-# We are currently standardized on using LLVM/Clang11 for this script.
+# We are currently standardized on using LLVM/Clang14 for this script.
 # Note that this is totally independent of the version of LLVM that you
-# are using to build Halide itself. If you don't have LLVM11 installed,
+# are using to build Halide itself. If you don't have LLVM14 installed,
 # you can usually install what you need easily via:
 #
-# sudo apt-get install llvm-11 clang-11 libclang-11-dev clang-tidy-11
-# export CLANG_TIDY_LLVM_INSTALL_DIR=/usr/lib/llvm-11
+# sudo apt-get install llvm-14 clang-14 libclang-14-dev clang-tidy-14
+# export CLANG_TIDY_LLVM_INSTALL_DIR=/usr/lib/llvm-14
 
 [ -z "$CLANG_TIDY_LLVM_INSTALL_DIR" ] && echo "CLANG_TIDY_LLVM_INSTALL_DIR must point to an LLVM installation dir for this script." && exit
 echo CLANG_TIDY_LLVM_INSTALL_DIR = ${CLANG_TIDY_LLVM_INSTALL_DIR}
 
 VERSION=$(${CLANG_TIDY_LLVM_INSTALL_DIR}/bin/clang-tidy --version)
-if [[ ${VERSION} =~ .*version\ 11.* ]]
+if [[ ${VERSION} =~ .*version\ 14.* ]]
 then
-    echo "clang-tidy version 11 found."
+    echo "clang-tidy version 14 found."
 else
-    echo "CLANG_TIDY_LLVM_INSTALL_DIR must point to an LLVM 11 install!"
+    echo "CLANG_TIDY_LLVM_INSTALL_DIR must point to an LLVM 14 install!"
     exit 1
 fi
 
@@ -47,9 +47,9 @@ cmake -DCMAKE_BUILD_TYPE=Debug \
 [ -a ${CLANG_TIDY_BUILD_DIR}/compile_commands.json ]
 
 # We must populate the includes directory to check things outside of src/
-cd ${CLANG_TIDY_BUILD_DIR} && make HalideIncludes
+cmake --build ${CLANG_TIDY_BUILD_DIR} --target HalideIncludes
 
-RUN_CLANG_TIDY=${CLANG_TIDY_LLVM_INSTALL_DIR}/share/clang/run-clang-tidy.py
+RUN_CLANG_TIDY=${CLANG_TIDY_LLVM_INSTALL_DIR}/bin/run-clang-tidy
 
 # We deliberately skip apps/ and test/ for now, as the compile commands won't include
 # generated headers files from Generators.

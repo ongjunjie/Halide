@@ -40,7 +40,7 @@ void check_interleave_count(Func f, int correct) {
     if (c < correct) {
         printf("Func %s should have interleaved >= %d times but interleaved %d times instead.\n",
                f.name().c_str(), correct, c);
-        exit(-1);
+        exit(1);
     }
 }
 
@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
                 float delta = result(x) - correct;
                 if (delta > 0.01 || delta < -0.01) {
                     printf("result(%d) = %f instead of %f\n", x, result(x), correct);
-                    return -1;
+                    return 1;
                 }
             }
         }
@@ -164,7 +164,7 @@ int main(int argc, char **argv) {
                 float delta = buff3(x, y) - correct;
                 if (delta > 0.01 || delta < -0.01) {
                     printf("result(%d) = %f instead of %f\n", x, buff3(x, y), correct);
-                    return -1;
+                    return 1;
                 }
             }
         }
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
                 float delta = buff4(x, y) - correct;
                 if (delta > 0.01 || delta < -0.01) {
                     printf("result(%d) = %f instead of %f\n", x, buff4(x, y), correct);
-                    return -1;
+                    return 1;
                 }
             }
         }
@@ -252,7 +252,7 @@ int main(int argc, char **argv) {
                 float delta = buff5(x, y) - correct;
                 if (delta > 0.01 || delta < -0.01) {
                     printf("result(%d) = %f instead of %f\n", x, buff5(x, y), correct);
-                    return -1;
+                    return 1;
                 }
             }
         }
@@ -342,7 +342,7 @@ int main(int argc, char **argv) {
                             if (out(x, y) != ref(x, y)) {
                                 printf("result(%d, %d) = %d instead of %d\n",
                                        x, y, out(x, y), ref(x, y));
-                                return -1;
+                                return 1;
                             }
                         }
                     }
@@ -352,8 +352,11 @@ int main(int argc, char **argv) {
         delete refs;
     }
 
-    {
-        // Test transposition
+    for (int sz : {8, 27, 256}) {
+        // Test transposition at a reasonable size (8), at a weird
+        // size (27), and at a totally unreasonable size (256) to make sure
+        // nothing crashes at least (256 x 256 would overflow the
+        // number of vector lanes we can represent)
         Func square("square");
         square(x, y) = cast(UInt(16), 5 * x + y);
 
@@ -361,12 +364,12 @@ int main(int argc, char **argv) {
         trans(x, y) = square(y, x);
 
         square.compute_root()
-            .bound(x, 0, 8)
-            .bound(y, 0, 8);
+            .bound(x, 0, sz)
+            .bound(y, 0, sz);
 
         trans.compute_root()
-            .bound(x, 0, 8)
-            .bound(y, 0, 8)
+            .bound(x, 0, sz)
+            .bound(y, 0, sz)
             .unroll(x)
             .vectorize(y);
 
@@ -374,26 +377,31 @@ int main(int argc, char **argv) {
             .dim(0)
             .set_min(0)
             .set_stride(1)
-            .set_extent(8)
+            .set_extent(sz)
             .dim(1)
             .set_min(0)
-            .set_stride(8)
-            .set_extent(8);
+            .set_stride(sz)
+            .set_extent(sz);
 
-        Buffer<uint16_t> result7(8, 8);
-        trans.realize(result7);
+        if (sz < 256) {
+            // LLVM chokes on the 256x256 case
+            Buffer<uint16_t> result7(sz, sz);
+            trans.realize(result7);
 
-        for (int x = 0; x < 8; x++) {
-            for (int y = 0; y < 8; y++) {
-                int correct = 5 * y + x;
-                if (result7(x, y) != correct) {
-                    printf("result(%d) = %d instead of %d\n", x, result7(x, y), correct);
-                    return -1;
+            for (int x = 0; x < sz; x++) {
+                for (int y = 0; y < sz; y++) {
+                    int correct = 5 * y + x;
+                    if (result7(x, y) != correct) {
+                        printf("result(%d) = %d instead of %d\n", x, result7(x, y), correct);
+                        return 1;
+                    }
                 }
             }
+            check_interleave_count(trans, 1);
+        } else {
+            // We don't expect an interleave at 256 x 256
+            check_interleave_count(trans, 0);
         }
-
-        check_interleave_count(trans, 1);
     }
 
     printf("Success!\n");

@@ -3,7 +3,6 @@
 #include <sstream>
 #include <utility>
 
-#include "CodeGen_C.h"
 #include "CodeGen_D3D12Compute_Dev.h"
 #include "CodeGen_GPU_Dev.h"
 #include "CodeGen_Internal.h"
@@ -62,10 +61,10 @@ public:
 protected:
     friend struct StoragePackUnpack;
 
-    class CodeGen_D3D12Compute_C : public CodeGen_C {
+    class CodeGen_D3D12Compute_C : public CodeGen_GPU_C {
     public:
         CodeGen_D3D12Compute_C(std::ostream &s, const Target &t)
-            : CodeGen_C(s, t) {
+            : CodeGen_GPU_C(s, t) {
             integer_suffix_style = IntegerSuffixStyle::HLSL;
         }
         void add_kernel(Stmt stmt,
@@ -88,7 +87,7 @@ protected:
 
         std::string print_assignment(Type t, const std::string &rhs) override;
 
-        using CodeGen_C::visit;
+        using CodeGen_GPU_C::visit;
         void visit(const Evaluate *op) override;
         void visit(const Min *) override;
         void visit(const Max *) override;
@@ -252,7 +251,7 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::visit(const Evaluate *op)
 }
 
 string CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::print_extern_call(const Call *op) {
-    internal_assert(!function_takes_user_context(op->name));
+    internal_assert(!function_takes_user_context(op->name)) << op->name;
 
     vector<string> args(op->args.size());
     for (size_t i = 0; i < op->args.size(); i++) {
@@ -303,7 +302,7 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::visit(const For *loop) {
 
     if (!is_gpu_var(loop->name)) {
         user_assert(loop->for_type != ForType::Parallel) << "Cannot use parallel loops inside D3D12Compute kernel\n";
-        CodeGen_C::visit(loop);
+        CodeGen_GPU_C::visit(loop);
         return;
     }
 
@@ -379,8 +378,11 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::visit(const Call *op) {
         // If we know pow(x, y) is called with x > 0, we can use HLSL's pow
         // directly.
         stream << "pow(" << print_expr(op->args[0]) << ", " << print_expr(op->args[1]) << ")";
+    } else if (op->is_intrinsic(Call::round)) {
+        // HLSL's round intrinsic has the correct semantics for our rounding.
+        print_assignment(op->type, "round(" + print_expr(op->args[0]) + ")");
     } else {
-        CodeGen_C::visit(op);
+        CodeGen_GPU_C::visit(op);
     }
 }
 
@@ -815,7 +817,7 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::visit(const Free *op) {
 
 string CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::print_assignment(Type type, const string &rhs) {
     string rhs_modified = print_reinforced_cast(type, rhs);
-    return CodeGen_C::print_assignment(type, rhs_modified);
+    return CodeGen_GPU_C::print_assignment(type, rhs_modified);
 }
 
 string CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::print_vanilla_cast(Type type, const string &value_expr) {
@@ -964,13 +966,20 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::visit(const FloatImm *op)
     // have seen division-by-zero shader warnings, and we postulated that it
     // could be indirectly related to compiler assumptions on signed integer
     // overflow when float_from_bits() is called, but we don't know for sure
-    return CodeGen_C::visit(op);
+    return CodeGen_GPU_C::visit(op);
 }
 
 void CodeGen_D3D12Compute_Dev::add_kernel(Stmt s,
                                           const string &name,
                                           const vector<DeviceArgument> &args) {
     debug(2) << "CodeGen_D3D12Compute_Dev::compile " << name << "\n";
+
+    // We need to scalarize/de-predicate any loads/stores, since HLSL does not
+    // support predication.
+    s = scalarize_predicated_loads_stores(s);
+
+    debug(2) << "CodeGen_D3D12Compute_Dev: after removing predication: \n"
+             << s;
 
     // TODO: do we have to uniquify these names, or can we trust that they are safe?
     cur_kernel_name = name;
@@ -1040,10 +1049,7 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::add_kernel(Stmt s,
                 std::string new_name = unique_name(op->name);
                 replacements[op->name] = new_name;
 
-                std::vector<Expr> new_extents;
-                for (size_t i = 0; i < op->extents.size(); i++) {
-                    new_extents.push_back(mutate(op->extents[i]));
-                }
+                auto new_extents = mutate(op->extents);
                 Stmt new_body = mutate(op->body);
                 Expr new_condition = mutate(op->condition);
                 Expr new_new_expr;
@@ -1053,7 +1059,7 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::add_kernel(Stmt s,
 
                 Stmt new_alloc = Allocate::make(new_name, op->type, op->memory_type, new_extents,
                                                 std::move(new_condition), std::move(new_body),
-                                                std::move(new_new_expr), op->free_function);
+                                                std::move(new_new_expr), op->free_function, op->padding);
 
                 allocs.push_back(new_alloc);
                 replacements.erase(op->name);
@@ -1228,10 +1234,10 @@ void CodeGen_D3D12Compute_Dev::CodeGen_D3D12Compute_C::add_kernel(Stmt s,
     print(s);
     close_scope("kernel " + name);
 
-    for (size_t i = 0; i < args.size(); i++) {
+    for (const auto &arg : args) {
         // Remove buffer arguments from allocation scope
-        if (args[i].is_buffer) {
-            allocations.pop(args[i].name);
+        if (arg.is_buffer) {
+            allocations.pop(arg.name);
         }
     }
 
@@ -1268,7 +1274,7 @@ void CodeGen_D3D12Compute_Dev::init_module() {
            "\n"
         << "\n";
 
-    src_stream << "#define halide_unused(x) (void)(x)\n";
+    src_stream << "#define halide_maybe_unused(x) (void)(x)\n";
 
     // Write out the Halide math functions.
     src_stream
@@ -1308,7 +1314,6 @@ void CodeGen_D3D12Compute_Dev::init_module() {
         << "#define abs_f32     abs    \n"
         << "#define floor_f32   floor  \n"
         << "#define ceil_f32    ceil   \n"
-        << "#define round_f32   round  \n"
         << "#define trunc_f32   trunc  \n"
         // pow() in HLSL has the same semantics as C if
         // x > 0.  Otherwise, we need to emulate C

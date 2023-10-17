@@ -1,8 +1,12 @@
 #ifndef HALIDE_RUNTIME_INTERNAL_H
 #define HALIDE_RUNTIME_INTERNAL_H
 
+#ifdef COMPILING_HALIDE_RUNTIME_TESTS
+// Only allowed if building Halide runtime tests ... since they use system compiler which may be GCC or MSVS
+#else
 #if __STDC_HOSTED__
 #error "Halide runtime files must be compiled with clang in freestanding mode."
+#endif
 #endif
 
 #ifdef __UINT8_TYPE__
@@ -56,17 +60,20 @@ typedef ptrdiff_t ssize_t;
 // --------------
 
 #ifdef BITS_64
-#define INT64_C(c) c##L
-#define UINT64_C(c) c##UL
 typedef uint64_t uintptr_t;
 typedef int64_t intptr_t;
 #endif
 
 #ifdef BITS_32
-#define INT64_C(c) c##LL
-#define UINT64_C(c) c##ULL
 typedef uint32_t uintptr_t;
 typedef int32_t intptr_t;
+#endif
+
+#if !defined(BITS_32) && !defined(BITS_64)
+typedef __UINTPTR_TYPE__ uintptr_t;
+typedef __INTPTR_TYPE__ intptr_t;
+static_assert(sizeof(uintptr_t) == sizeof(void *));
+static_assert(sizeof(intptr_t) == sizeof(void *));
 #endif
 
 #define STDOUT_FILENO 1
@@ -92,11 +99,21 @@ int strncmp(const char *s, const char *t, size_t n);
 size_t strlen(const char *s);
 const char *strchr(const char *s, int c);
 void *memcpy(void *s1, const void *s2, size_t n);
+void *memmove(void *dest, const void *src, size_t n);
 int memcmp(const void *s1, const void *s2, size_t n);
 void *memset(void *s, int val, size_t n);
+
+// No: don't call fopen() directly; some platforms may want to require
+// use of other calls instead, so you should bottleneck all calls to fopen()
+// to halide_fopen() instead, which allows for link-time overriding.
+//
 // Use fopen+fileno+fclose instead of open+close - the value of the
 // flags passed to open are different on every platform
-void *fopen(const char *, const char *);
+//
+// void *fopen(const char *, const char *);
+
+WEAK_INLINE void *halide_fopen(const char *filename, const char *type);
+
 int fileno(void *);
 int fclose(void *);
 int close(int);
@@ -164,11 +181,6 @@ WEAK int halide_device_and_host_free(void *user_context, struct halide_buffer_t 
 
 struct halide_filter_metadata_t;
 
-struct mxArray;
-WEAK int halide_matlab_call_pipeline(void *user_context,
-                                     int (*pipeline)(void **args), const halide_filter_metadata_t *metadata,
-                                     int nlhs, mxArray **plhs, int nrhs, const mxArray **prhs);
-
 WEAK int halide_trace_helper(void *user_context,
                              const char *func,
                              void *value, int *coords,
@@ -180,16 +192,31 @@ WEAK int halide_trace_helper(void *user_context,
 struct halide_pseudostack_slot_t {
     void *ptr;
     size_t size;
+    size_t cumulative_size;
 };
 
 WEAK void halide_use_jit_module();
 WEAK void halide_release_jit_module();
 
-WEAK_INLINE int halide_malloc_alignment();
+// These are all intended to be inlined into other pieces of runtime code;
+// they are not intended to be called or replaced by user code.
+WEAK_INLINE int halide_internal_malloc_alignment();
+WEAK_INLINE void *halide_internal_aligned_alloc(size_t alignment, size_t size);
+WEAK_INLINE void halide_internal_aligned_free(void *ptr);
 
 void halide_thread_yield();
 
 }  // extern "C"
+
+template<typename T>
+ALWAYS_INLINE T align_up(T p, size_t alignment) {
+    return (p + alignment - 1) & ~(alignment - 1);
+}
+
+template<typename T>
+ALWAYS_INLINE T is_power_of_two(T value) {
+    return (value != 0) && ((value & (value - 1)) == 0);
+}
 
 namespace {
 template<typename T>
@@ -214,7 +241,8 @@ ALWAYS_INLINE T min(const T &a, const T &b) {
 // A namespace for runtime modules to store their internal state
 // in. Should not be for things communicated between runtime modules,
 // because it's possible for them to be compiled with different c++
-// name mangling due to mixing and matching target triples.
+// name mangling due to mixing and matching target triples (this usually
+// only affects Windows builds).
 namespace Halide {
 namespace Runtime {
 namespace Internal {
@@ -224,17 +252,33 @@ namespace Internal {
 }  // namespace Halide
 using namespace Halide::Runtime::Internal;
 
-/** A macro that calls halide_print if the supplied condition is
- * false, then aborts. Used for unrecoverable errors, or
- * should-never-happen errors. */
+/** halide_abort_if_false() is a macro that calls halide_print if the supplied condition is
+ * false, then aborts. Used for unrecoverable errors, or should-never-happen errors.
+ *
+ * Note that this is *NOT* a debug-only macro;
+ * the condition will be checked in *all* build modes! */
 #define _halide_stringify(x) #x
 #define _halide_expand_and_stringify(x) _halide_stringify(x)
-#define halide_assert(user_context, cond)                                                                                  \
-    do {                                                                                                                   \
-        if (!(cond)) {                                                                                                     \
-            halide_print(user_context, __FILE__ ":" _halide_expand_and_stringify(__LINE__) " Assert failed: " #cond "\n"); \
-            abort();                                                                                                       \
-        }                                                                                                                  \
+#define halide_abort_if_false(user_context, cond)                                                                                           \
+    do {                                                                                                                                    \
+        if (!(cond)) {                                                                                                                      \
+            halide_print(user_context, __FILE__ ":" _halide_expand_and_stringify(__LINE__) " halide_abort_if_false() failed: " #cond "\n"); \
+            abort();                                                                                                                        \
+        }                                                                                                                                   \
     } while (0)
 
+/** halide_debug_assert() is like halide_assert(), but only expands into a check when
+ * DEBUG_RUNTIME is defined. It is what you want to use in almost all cases. */
+#ifdef DEBUG_RUNTIME
+#define halide_debug_assert(user_context, cond)                                                                                           \
+    do {                                                                                                                                  \
+        if (!(cond)) {                                                                                                                    \
+            halide_print(user_context, __FILE__ ":" _halide_expand_and_stringify(__LINE__) " halide_debug_assert() failed: " #cond "\n"); \
+            abort();                                                                                                                      \
+        }                                                                                                                                 \
+    } while (0)
+#else
+#define halide_debug_assert(user_context, cond)
 #endif
+
+#endif  // HALIDE_RUNTIME_INTERNAL_H

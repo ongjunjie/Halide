@@ -57,6 +57,7 @@ private:
     void visit(const FloatImm *) override;
     void visit(const StringImm *) override;
     void visit(const Cast *) override;
+    void visit(const Reinterpret *) override;
     void visit(const Variable *) override;
     void visit(const Add *) override;
     void visit(const Sub *) override;
@@ -106,6 +107,22 @@ IRComparer::CmpResult IRComparer::compare_scalar(T a, T b) {
         return result;
     }
 
+    if constexpr (std::is_floating_point_v<T>) {
+        // NaNs are equal to each other and less than non-nans
+        if (std::isnan(a) && std::isnan(b)) {
+            result = Equal;
+            return result;
+        }
+        if (std::isnan(a)) {
+            result = LessThan;
+            return result;
+        }
+        if (std::isnan(b)) {
+            result = GreaterThan;
+            return result;
+        }
+    }
+
     if (a < b) {
         result = LessThan;
     } else if (a > b) {
@@ -125,6 +142,7 @@ IRComparer::CmpResult IRComparer::compare_expr(const Expr &a, const Expr &b) {
         return result;
     }
 
+    // Undefined values are equal to each other and less than defined values
     if (!a.defined() && !b.defined()) {
         result = Equal;
         return result;
@@ -337,6 +355,10 @@ void IRComparer::visit(const Cast *op) {
     compare_expr(expr.as<Cast>()->value, op->value);
 }
 
+void IRComparer::visit(const Reinterpret *op) {
+    compare_expr(expr.as<Reinterpret>()->value, op->value);
+}
+
 void IRComparer::visit(const Variable *op) {
     const Variable *e = expr.as<Variable>();
     compare_names(e->name, op->name);
@@ -512,6 +534,7 @@ void IRComparer::visit(const Allocate *op) {
     const Allocate *s = stmt.as<Allocate>();
 
     compare_names(s->name, op->name);
+    compare_types(s->type, op->type);
     compare_expr_vector(s->extents, op->extents);
     compare_stmt(s->body, op->body);
     compare_expr(s->condition, op->condition);
@@ -626,6 +649,11 @@ bool graph_equal(const Expr &a, const Expr &b) {
     return IRComparer(&cache).compare_expr(a, b) == IRComparer::Equal;
 }
 
+bool graph_less_than(const Expr &a, const Expr &b) {
+    IRCompareCache cache(8);
+    return IRComparer(&cache).compare_expr(a, b) == IRComparer::LessThan;
+}
+
 bool equal(const Stmt &a, const Stmt &b) {
     return IRComparer().compare_stmt(a, b) == IRComparer::Equal;
 }
@@ -633,6 +661,11 @@ bool equal(const Stmt &a, const Stmt &b) {
 bool graph_equal(const Stmt &a, const Stmt &b) {
     IRCompareCache cache(8);
     return IRComparer(&cache).compare_stmt(a, b) == IRComparer::Equal;
+}
+
+bool graph_less_than(const Stmt &a, const Stmt &b) {
+    IRCompareCache cache(8);
+    return IRComparer(&cache).compare_stmt(a, b) == IRComparer::LessThan;
 }
 
 bool IRDeepCompare::operator()(const Expr &a, const Expr &b) const {

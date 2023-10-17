@@ -163,9 +163,16 @@ void populate_fused_pairs_list(const string &func, const Definition &def,
                    func, stage_index, fuse_level.var().name());
     if (fuse_level.stage_index() == 0) {
         parent.definition().schedule().fused_pairs().push_back(pair);
+        for (auto &s : parent.definition().specializations()) {
+            s.definition.schedule().fused_pairs().push_back(pair);
+        }
     } else {
         internal_assert(fuse_level.stage_index() > 0);
-        parent.update(fuse_level.stage_index() - 1).schedule().fused_pairs().push_back(pair);
+        auto &fuse_stage = parent.update(fuse_level.stage_index() - 1);
+        fuse_stage.schedule().fused_pairs().push_back(pair);
+        for (auto &s : fuse_stage.specializations()) {
+            s.definition.schedule().fused_pairs().push_back(pair);
+        }
     }
 }
 
@@ -293,9 +300,7 @@ pair<vector<string>, vector<vector<string>>> realization_order(
     // Determine groups of functions which loops are to be fused together.
     // 'fused_groups' maps a fused group to its members.
     // 'group_name' maps a function to the name of the fused group it belongs to.
-    map<string, vector<string>> fused_groups;
-    map<string, string> group_name;
-    std::tie(fused_groups, group_name) = find_fused_groups(env, fuse_adjacency_list);
+    auto [fused_groups, group_name] = find_fused_groups(env, fuse_adjacency_list);
 
     // Compute the DAG representing the pipeline
     for (const pair<const string, Function> &caller : env) {

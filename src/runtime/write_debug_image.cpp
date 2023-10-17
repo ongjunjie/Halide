@@ -110,7 +110,7 @@ WEAK bool ends_with(const char *filename, const char *suffix) {
 struct ScopedFile {
     void *f;
     ALWAYS_INLINE ScopedFile(const char *filename, const char *mode) {
-        f = fopen(filename, mode);
+        f = halide_fopen(filename, mode);
     }
     ALWAYS_INLINE ~ScopedFile() {
         if (f) {
@@ -129,24 +129,27 @@ struct ScopedFile {
 }  // namespace Runtime
 }  // namespace Halide
 
-WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *filename,
-                                             int32_t type_code, struct halide_buffer_t *buf) {
+WEAK extern "C" int halide_debug_to_file(void *user_context, const char *filename,
+                                         int32_t type_code, struct halide_buffer_t *buf) {
 
     if (buf->is_bounds_query()) {
         halide_error(user_context, "Bounds query buffer passed to halide_debug_to_file");
-        return -1;
+        return halide_error_code_host_is_null;
     }
 
     if (buf->dimensions > 4) {
         halide_error(user_context, "Can't debug_to_file a Func with more than four dimensions\n");
-        return -1;
+        return halide_error_code_bad_dimensions;
     }
 
-    halide_copy_to_host(user_context, buf);
+    if (auto result = halide_copy_to_host(user_context, buf);
+        result != halide_error_code_success) {
+        return result;
+    }
 
     ScopedFile f(filename, "wb");
     if (!f.open()) {
-        return -2;
+        return halide_error_code_debug_to_file_failed;
     }
 
     size_t elts = 1;
@@ -220,7 +223,7 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
         header.height_resolution[1] = 1;
 
         if (!f.write((void *)(&header), sizeof(header))) {
-            return -3;
+            return halide_error_code_debug_to_file_failed;
         }
 
         if (channels > 1) {
@@ -228,14 +231,14 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
 
             for (int32_t i = 0; i < channels; i++) {
                 if (!f.write((void *)(&offset), 4)) {
-                    return -4;
+                    return halide_error_code_debug_to_file_failed;
                 }
                 offset += shape[0].extent * shape[1].extent * depth * bytes_per_element;
             }
             int32_t count = shape[0].extent * shape[1].extent * depth * bytes_per_element;
             for (int32_t i = 0; i < channels; i++) {
                 if (!f.write((void *)(&count), 4)) {
-                    return -5;
+                    return halide_error_code_debug_to_file_failed;
                 }
             }
         }
@@ -271,11 +274,13 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
         f.write(header, 128);
 
         size_t payload_bytes = buf->size_in_bytes();
+        final_padding_bytes = 7 - ((payload_bytes - 1) & 7);
 
-        // level 5 .mat files have a size limit
-        if ((uint64_t)payload_bytes >> 32) {
+        // level 5 .mat files have a size limit. (Padding itself should never cause the overflow.
+        // Code written this way for safety.)
+        if (((uint64_t)payload_bytes + final_padding_bytes) >> 32) {
             halide_error(user_context, "Can't debug_to_file to a .mat file greater than 4GB\n");
-            return -6;
+            return halide_error_code_debug_to_file_failed;
         }
 
         int dims = buf->dimensions;
@@ -288,38 +293,36 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
 
         uint32_t tags[] = {
             // This is a matrix
-            14, 40 + padded_dimensions * 4 + padded_name_size + (uint32_t)payload_bytes,
+            14, 40 + padded_dimensions * 4 + padded_name_size + (uint32_t)payload_bytes + final_padding_bytes,
             // The element type
             6, 8, pixel_type_to_matlab_class_code[type_code], 1,
             // The shape
             5, (uint32_t)(dims * 4)};
 
         if (!f.write(&tags, sizeof(tags))) {
-            return -7;
+            return halide_error_code_debug_to_file_failed;
         }
 
         int extents[] = {shape[0].extent, shape[1].extent, shape[2].extent, shape[3].extent};
         if (!f.write(&extents, padded_dimensions * 4)) {
-            return -8;
+            return halide_error_code_debug_to_file_failed;
         }
 
         // The name
         uint32_t name_header[2] = {1, name_size};
         if (!f.write(&name_header, sizeof(name_header))) {
-            return -9;
+            return halide_error_code_debug_to_file_failed;
         }
 
         if (!f.write(array_name, padded_name_size)) {
-            return -10;
+            return halide_error_code_debug_to_file_failed;
         }
-
-        final_padding_bytes = 7 - ((payload_bytes - 1) & 7);
 
         // Payload header
         uint32_t payload_header[2] = {
             pixel_type_to_matlab_type_code[type_code], (uint32_t)payload_bytes};
         if (!f.write(payload_header, sizeof(payload_header))) {
-            return -11;
+            return halide_error_code_debug_to_file_failed;
         }
     } else {
         int32_t header[] = {shape[0].extent,
@@ -328,7 +331,7 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
                             shape[3].extent,
                             type_code};
         if (!f.write((void *)(&header[0]), sizeof(header))) {
-            return -12;
+            return halide_error_code_debug_to_file_failed;
         }
     }
 
@@ -351,7 +354,7 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
                     if (counter == max_elts) {
                         counter = 0;
                         if (!f.write((void *)temp, max_elts * bytes_per_element)) {
-                            return -13;
+                            return halide_error_code_debug_to_file_failed;
                         }
                     }
                 }
@@ -360,7 +363,7 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
     }
     if (counter > 0) {
         if (!f.write((void *)temp, counter * bytes_per_element)) {
-            return -14;
+            return halide_error_code_debug_to_file_failed;
         }
     }
 
@@ -368,12 +371,12 @@ WEAK extern "C" int32_t halide_debug_to_file(void *user_context, const char *fil
     if (final_padding_bytes) {
         if (final_padding_bytes > sizeof(zero)) {
             halide_error(user_context, "Unexpectedly large final_padding_bytes");
-            return -15;
+            return halide_error_code_debug_to_file_failed;
         }
         if (!f.write(&zero, final_padding_bytes)) {
-            return -16;
+            return halide_error_code_debug_to_file_failed;
         }
     }
 
-    return 0;
+    return halide_error_code_success;
 }

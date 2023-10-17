@@ -9,12 +9,11 @@ class LocalLaplacian : public Halide::Generator<LocalLaplacian> {
 public:
     GeneratorParam<int> pyramid_levels{"pyramid_levels", 8, 1, maxJ};
 
-    Input<Buffer<uint16_t>> input{"input", 3};
+    Input<Buffer<uint16_t, 3>> input{"input"};
     Input<int> levels{"levels"};
     Input<float> alpha{"alpha"};
     Input<float> beta{"beta"};
-
-    Output<Buffer<uint16_t>> output{"output", 3};
+    Output<Buffer<uint16_t, 3>> output{"output"};
 
     void generate() {
         /* THE ALGORITHM */
@@ -99,7 +98,7 @@ public:
         output.set_estimates({{0, 1536}, {0, 2560}, {0, 3}});
 
         /* THE SCHEDULE */
-        if (auto_schedule) {
+        if (using_autoscheduler()) {
             // Nothing.
         } else if (get_target().has_gpu_feature()) {
             // GPU schedule.
@@ -228,17 +227,17 @@ private:
     Func downsample(Func f) {
         using Halide::_;
         Func downx, downy;
-        downx(x, y, _) = (f(2 * x - 1, y, _) + 3.0f * (f(2 * x, y, _) + f(2 * x + 1, y, _)) + f(2 * x + 2, y, _)) / 8.0f;
-        downy(x, y, _) = (downx(x, 2 * y - 1, _) + 3.0f * (downx(x, 2 * y, _) + downx(x, 2 * y + 1, _)) + downx(x, 2 * y + 2, _)) / 8.0f;
-        return downy;
+        downy(x, y, _) = (f(x, 2 * y - 1, _) + 3.0f * (f(x, 2 * y, _) + f(x, 2 * y + 1, _)) + f(x, 2 * y + 2, _)) / 8.0f;
+        downx(x, y, _) = (downy(2 * x - 1, y, _) + 3.0f * (downy(2 * x, y, _) + downy(2 * x + 1, y, _)) + downy(2 * x + 2, y, _)) / 8.0f;
+        return downx;
     }
 
     // Upsample using bilinear interpolation
     Func upsample(Func f) {
         using Halide::_;
         Func upx, upy;
-        upx(x, y, _) = lerp(f(x / 2, y, _), f((x + 1) / 2, y, _), ((x % 2) * 2 + 1) / 4.0f);
-        upy(x, y, _) = lerp(upx(x, y / 2, _), upx(x, (y + 1) / 2, _), ((y % 2) * 2 + 1) / 4.0f);
+        upx(x, y, _) = lerp(f((x + 1) / 2, y, _), f((x - 1) / 2, y, _), ((x % 2) * 2 + 1) / 4.0f);
+        upy(x, y, _) = lerp(upx(x, (y + 1) / 2, _), upx(x, (y - 1) / 2, _), ((y % 2) * 2 + 1) / 4.0f);
         return upy;
     }
 };

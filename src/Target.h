@@ -40,7 +40,6 @@ struct Target {
         ArchUnknown = 0,
         X86,
         ARM,
-        MIPS,
         Hexagon,
         POWERPC,
         WebAssembly,
@@ -49,6 +48,32 @@ struct Target {
 
     /** The bit-width of the target machine. Must be 0 for unknown, or 32 or 64. */
     int bits = 0;
+
+    /** The bit-width of a vector register for targets where this is configurable and
+     * targeting a fixed size is desired. The default of 0 indicates no assumption of
+     * fixed size is allowed. */
+    int vector_bits = 0;
+
+    /** The specific processor to be targeted, tuned for.
+     * Corresponds to processor_name_map in Target.cpp.
+     *
+     * New entries should be added to the end. */
+    enum Processor {
+        /// Do not tune for any specific CPU. In practice, this means that halide will decide the tune CPU based on the enabled features.
+        ProcessorGeneric = 0,
+        K8,        /// Tune for AMD K8 Hammer CPU (AMD Family 0Fh, launched 2003).
+        K8_SSE3,   /// Tune for later versions of AMD K8 CPU, with SSE3 support.
+        AMDFam10,  /// Tune for AMD K10 "Barcelona" CPU (AMD Family 10h, launched 2007).
+        BtVer1,    /// Tune for AMD Bobcat CPU (AMD Family 14h, launched 2011).
+        BdVer1,    /// Tune for AMD Bulldozer CPU (AMD Family 15h, launched 2011).
+        BdVer2,    /// Tune for AMD Piledriver CPU (AMD Family 15h (2nd-gen), launched 2012).
+        BdVer3,    /// Tune for AMD Steamroller CPU (AMD Family 15h (3nd-gen), launched 2014).
+        BdVer4,    /// Tune for AMD Excavator CPU (AMD Family 15h (4th-gen), launched 2015).
+        BtVer2,    /// Tune for AMD Jaguar CPU (AMD Family 16h, launched 2013).
+        ZnVer1,    /// Tune for AMD Zen   CPU (AMD Family 17h, launched 2017).
+        ZnVer2,    /// Tune for AMD Zen 2 CPU (AMD Family 17h, launched 2019).
+        ZnVer3,    /// Tune for AMD Zen 3 CPU (AMD Family 19h, launched 2020).
+    } processor_tune = ProcessorGeneric;
 
     /** Optional features a target can have.
      * Corresponds to feature_name_map in Target.cpp.
@@ -78,14 +103,14 @@ struct Target {
         CUDACapability70 = halide_target_feature_cuda_capability70,
         CUDACapability75 = halide_target_feature_cuda_capability75,
         CUDACapability80 = halide_target_feature_cuda_capability80,
+        CUDACapability86 = halide_target_feature_cuda_capability86,
         OpenCL = halide_target_feature_opencl,
         CLDoubles = halide_target_feature_cl_doubles,
         CLHalf = halide_target_feature_cl_half,
         CLAtomics64 = halide_target_feature_cl_atomic64,
-        OpenGLCompute = halide_target_feature_openglcompute,
+        OpenGLCompute = halide_target_feature_openglcompute,  // NOTE: This feature is deprecated and will be removed in Halide 17.
         EGL = halide_target_feature_egl,
         UserContext = halide_target_feature_user_context,
-        Matlab = halide_target_feature_matlab,
         Profile = halide_target_feature_profile,
         NoRuntime = halide_target_feature_no_runtime,
         Metal = halide_target_feature_metal,
@@ -98,7 +123,6 @@ struct Target {
         HVX_v62 = halide_target_feature_hvx_v62,
         HVX_v65 = halide_target_feature_hvx_v65,
         HVX_v66 = halide_target_feature_hvx_v66,
-        HVX_shared_object = halide_target_feature_hvx_use_shared_object,
         FuzzFloatStores = halide_target_feature_fuzz_float_stores,
         SoftFloatABI = halide_target_feature_soft_float_abi,
         MSAN = halide_target_feature_msan,
@@ -118,26 +142,45 @@ struct Target {
         CheckUnsafePromises = halide_target_feature_check_unsafe_promises,
         EmbedBitcode = halide_target_feature_embed_bitcode,
         EnableLLVMLoopOpt = halide_target_feature_enable_llvm_loop_opt,
-        DisableLLVMLoopOpt = halide_target_feature_disable_llvm_loop_opt,
         WasmSimd128 = halide_target_feature_wasm_simd128,
         WasmSignExt = halide_target_feature_wasm_signext,
         WasmSatFloatToInt = halide_target_feature_wasm_sat_float_to_int,
         WasmThreads = halide_target_feature_wasm_threads,
         WasmBulkMemory = halide_target_feature_wasm_bulk_memory,
+        WebGPU = halide_target_feature_webgpu,
         SVE = halide_target_feature_sve,
         SVE2 = halide_target_feature_sve2,
         ARMDotProd = halide_target_feature_arm_dot_prod,
+        ARMFp16 = halide_target_feature_arm_fp16,
         LLVMLargeCodeModel = halide_llvm_large_code_model,
         RVV = halide_target_feature_rvv,
         ARMv81a = halide_target_feature_armv81a,
+        SanitizerCoverage = halide_target_feature_sanitizer_coverage,
+        ProfileByTimer = halide_target_feature_profile_by_timer,
+        SPIRV = halide_target_feature_spirv,
+        Vulkan = halide_target_feature_vulkan,
+        VulkanInt8 = halide_target_feature_vulkan_int8,
+        VulkanInt16 = halide_target_feature_vulkan_int16,
+        VulkanInt64 = halide_target_feature_vulkan_int64,
+        VulkanFloat16 = halide_target_feature_vulkan_float16,
+        VulkanFloat64 = halide_target_feature_vulkan_float64,
+        VulkanV10 = halide_target_feature_vulkan_version10,
+        VulkanV12 = halide_target_feature_vulkan_version12,
+        VulkanV13 = halide_target_feature_vulkan_version13,
+        Semihosting = halide_target_feature_semihosting,
         FeatureEnd = halide_target_feature_end
     };
     Target() = default;
-    Target(OS o, Arch a, int b, const std::vector<Feature> &initial_features = std::vector<Feature>())
-        : os(o), arch(a), bits(b) {
+    Target(OS o, Arch a, int b, Processor pt, const std::vector<Feature> &initial_features = std::vector<Feature>(),
+           int vb = 0)
+        : os(o), arch(a), bits(b), vector_bits(vb), processor_tune(pt) {
         for (const auto &f : initial_features) {
             set_feature(f);
         }
+    }
+
+    Target(OS o, Arch a, int b, const std::vector<Feature> &initial_features = std::vector<Feature>())
+        : Target(o, a, b, ProcessorGeneric, initial_features) {
     }
 
     /** Given a string of the form used in HL_TARGET
@@ -223,6 +266,7 @@ struct Target {
         return os == other.os &&
                arch == other.arch &&
                bits == other.bits &&
+               processor_tune == other.processor_tune &&
                features == other.features;
     }
 
@@ -244,7 +288,7 @@ struct Target {
     /** Convert the Target into a string form that can be reconstituted
      * by merge_string(), which will always be of the form
      *
-     *   arch-bits-os-feature1-feature2...featureN.
+     *   arch-bits-os-processor-feature1-feature2...featureN.
      *
      * Note that is guaranteed that Target(t1.to_string()) == t1,
      * but not that Target(s).to_string() == s (since there can be
@@ -285,6 +329,11 @@ struct Target {
      * 20 (our minimum supported cuda compute capability) if no cuda
      * features are set. */
     int get_cuda_capability_lower_bound() const;
+
+    /** Get the minimum Vulkan capability found as an integer. Returns
+     * 10 (our minimum supported Vulkan compute capability) if no Vulkan
+     * features are set. */
+    int get_vulkan_capability_lower_bound() const;
 
     /** Was libHalide compiled with support for this target? */
     bool supported() const;

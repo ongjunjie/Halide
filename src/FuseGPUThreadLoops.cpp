@@ -68,21 +68,20 @@ class ExtractBlockSize : public IRVisitor {
         Scope<Interval> scope;
         scope.push(op->name, Interval(op->min, simplify(op->min + op->extent - 1)));
         // For non-rectangular thread loops, use a bounding box. We'll inject if statements later.
-        for (int i = 0; i < 4; i++) {
-            if (block_extent[i].defined() &&
-                expr_uses_var(block_extent[i], op->name)) {
-                block_extent[i] = simplify(common_subexpression_elimination(block_extent[i]));
-                block_extent[i] = simplify(bounds_of_expr_in_scope(block_extent[i], scope).max);
+        for (Expr &e : block_extent) {
+            if (e.defined() && expr_uses_var(e, op->name)) {
+                e = simplify(common_subexpression_elimination(e));
+                e = simplify(bounds_of_expr_in_scope(e, scope).max);
             }
         }
     }
 
     void visit(const LetStmt *op) override {
         IRVisitor::visit(op);
-        for (int i = 0; i < 4; i++) {
-            if (block_extent[i].defined() &&
-                expr_uses_var(block_extent[i], op->name)) {
-                block_extent[i] = simplify(Let::make(op->name, op->value, block_extent[i]));
+        for (Expr &e : block_extent) {
+            if (e.defined() &&
+                expr_uses_var(e, op->name)) {
+                e = simplify(Let::make(op->name, op->value, e));
             }
         }
     }
@@ -357,7 +356,7 @@ private:
                     // it's not exact.
                     debug(1)
                         << "Shared allocation for " << s.name
-                        << " has a size that is non-monontonic in the gpu block variable " << op->name
+                        << " has a size that is non-monotonic in the gpu block variable " << op->name
                         << ": " << s.size << "\n";
                     if (get_compiler_logger()) {
                         get_compiler_logger()->record_non_monotonic_loop_var(op->name, s.size);
@@ -482,8 +481,8 @@ private:
         alloc.type = op->type;
         alloc.liveness = IntInterval(barrier_stage, barrier_stage);
         alloc.size = 1;
-        for (size_t i = 0; i < op->extents.size(); i++) {
-            alloc.size *= op->extents[i];
+        for (const auto &extent : op->extents) {
+            alloc.size *= extent;
         }
         alloc.size = simplify(alloc.size);
         alloc.memory_type = op->memory_type;
@@ -760,7 +759,7 @@ public:
         // lifetimes, and then cluster the groups according to which
         // ones can share a single allocation. For cuda, opencl, and
         // similar we get one big combined allocation per memory
-        // type. For openglcompute and direct3d, we also separate by
+        // type. For vulkan, openglcompute and direct3d, we also separate by
         // element type.
         map<pair<MemoryType, Type>, vector<AllocGroup>> clustered_allocs;
 
@@ -1029,7 +1028,9 @@ public:
           thread_id_var_name(unique_name('t')),
           num_threads_var_name(unique_name('t')),
           may_merge_allocs_of_different_type(device_api != DeviceAPI::OpenGLCompute &&
-                                             device_api != DeviceAPI::D3D12Compute) {
+                                             device_api != DeviceAPI::D3D12Compute &&
+                                             device_api != DeviceAPI::Vulkan &&
+                                             device_api != DeviceAPI::WebGPU) {
     }
 };  // namespace Internal
 
@@ -1121,8 +1122,8 @@ class ExtractRegisterAllocations : public IRMutator {
         alloc.type = op->type;
         alloc.size = 1;
         alloc.loop_var = loop_var;
-        for (size_t i = 0; i < op->extents.size(); i++) {
-            alloc.size *= op->extents[i];
+        for (const auto &extent : op->extents) {
+            alloc.size *= extent;
         }
         alloc.size = simplify(mutate(alloc.size));
         alloc.memory_type = op->memory_type;
@@ -1189,7 +1190,7 @@ public:
 
     Stmt rewrap(Stmt body, const string &loop_var) {
         for (RegisterAllocation &alloc : allocations) {
-            if ((!loop_var.empty() && ends_with(alloc.loop_var, loop_var)) |
+            if ((!loop_var.empty() && ends_with(alloc.loop_var, loop_var)) ||
                 (loop_var.empty() && alloc.loop_var.empty())) {
                 body = Allocate::make(alloc.name, alloc.type, alloc.memory_type, {alloc.size}, const_true(), body);
             }
@@ -1279,6 +1280,7 @@ class InjectThreadBarriers : public IRMutator {
         case MemoryType::Register:
         case MemoryType::LockedCache:
         case MemoryType::VTCM:
+        case MemoryType::AMXTile:
             break;
         }
 
@@ -1303,6 +1305,7 @@ class InjectThreadBarriers : public IRMutator {
         case MemoryType::Register:
         case MemoryType::LockedCache:
         case MemoryType::VTCM:
+        case MemoryType::AMXTile:
             break;
         }
 
@@ -1488,7 +1491,8 @@ class ZeroGPULoopMins : public IRMutator {
         in_non_glsl_gpu = (in_non_glsl_gpu && op->device_api == DeviceAPI::None) ||
                           (op->device_api == DeviceAPI::CUDA) || (op->device_api == DeviceAPI::OpenCL) ||
                           (op->device_api == DeviceAPI::Metal) ||
-                          (op->device_api == DeviceAPI::D3D12Compute);
+                          (op->device_api == DeviceAPI::D3D12Compute) ||
+                          (op->device_api == DeviceAPI::Vulkan);
 
         Stmt stmt = IRMutator::visit(op);
         if (CodeGen_GPU_Dev::is_gpu_var(op->name) && !is_const_zero(op->min)) {

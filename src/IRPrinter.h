@@ -54,6 +54,7 @@ namespace Internal {
 
 struct AssociativePattern;
 struct AssociativeOp;
+class Closure;
 
 /** Emit a halide associative pattern on an output stream (such as std::cout)
  * in a human-readable form */
@@ -85,6 +86,9 @@ std::ostream &operator<<(std::ostream &stream, const LinkageType &);
 
 /** Emit a halide dimension type in human-readable format */
 std::ostream &operator<<(std::ostream &stream, const DimType &);
+
+/** Emit a Closure in human-readable format */
+std::ostream &operator<<(std::ostream &out, const Closure &c);
 
 struct Indentation {
     int indent;
@@ -151,6 +155,7 @@ protected:
     void visit(const FloatImm *) override;
     void visit(const StringImm *) override;
     void visit(const Cast *) override;
+    void visit(const Reinterpret *) override;
     void visit(const Variable *) override;
     void visit(const Add *) override;
     void visit(const Sub *) override;

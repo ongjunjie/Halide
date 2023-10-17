@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "ApplySplit.h"
+#include "CSE.h"
 #include "CodeGen_GPU_Dev.h"
 #include "ExprUsesVar.h"
 #include "Func.h"
@@ -79,6 +80,89 @@ bool contains_impure_call(const Expr &expr) {
     return is_not_pure.result;
 }
 
+// A mutator that performs a substitute operation only on either the values or the
+// arguments of Provide nodes.
+class SubstituteIn : public IRGraphMutator {
+    const string &name;
+    const Expr &value;
+    bool calls;
+    bool provides;
+
+    using IRMutator::visit;
+
+    Stmt visit(const Provide *p) override {
+        if (!provides) {
+            return IRMutator::visit(p);
+        }
+        vector<Expr> args;
+        bool changed = false;
+        for (const Expr &i : p->args) {
+            args.push_back(graph_substitute(name, value, i));
+            changed = changed || !args.back().same_as(i);
+        }
+        if (changed) {
+            return Provide::make(p->name, p->values, args, p->predicate);
+        } else {
+            return p;
+        }
+    }
+
+    Expr visit(const Call *op) override {
+        Expr result = IRMutator::visit(op);
+        if (calls && op->call_type == Call::Halide) {
+            result = graph_substitute(name, value, op);
+        }
+        return result;
+    }
+
+public:
+    SubstituteIn(const string &name, const Expr &value, bool calls, bool provides)
+        : name(name), value(value), calls(calls), provides(provides) {
+    }
+};
+
+Stmt substitute_in(const string &name, const Expr &value, bool calls, bool provides, const Stmt &s) {
+    return SubstituteIn(name, value, calls, provides).mutate(s);
+}
+
+class AddPredicates : public IRGraphMutator {
+    const Expr &cond;
+    bool calls;
+    bool provides;
+
+    using IRMutator::visit;
+
+    Stmt visit(const Provide *p) override {
+        auto [args, changed_args] = mutate_with_changes(p->args);
+        auto [values, changed_values] = mutate_with_changes(p->values);
+        Expr predicate = mutate(p->predicate);
+        if (provides) {
+            return Provide::make(p->name, values, args, predicate && cond);
+        } else if (changed_args || changed_values || !predicate.same_as(p->predicate)) {
+            return Provide::make(p->name, values, args, predicate);
+        } else {
+            return p;
+        }
+    }
+
+    Expr visit(const Call *op) override {
+        Expr result = IRMutator::visit(op);
+        if (calls && op->call_type == Call::Halide) {
+            result = Call::make(op->type, Call::if_then_else, {cond, result}, Call::PureIntrinsic);
+        }
+        return result;
+    }
+
+public:
+    AddPredicates(const Expr &cond, bool calls, bool provides)
+        : cond(cond), calls(calls), provides(provides) {
+    }
+};
+
+Stmt add_predicates(const Expr &cond, bool calls, bool provides, const Stmt &s) {
+    return AddPredicates(cond, calls, provides).mutate(s);
+}
+
 // Build a loop nest about a provide node using a schedule
 Stmt build_loop_nest(
     const Stmt &body,
@@ -118,13 +202,36 @@ Stmt build_loop_nest(
 
     vector<Split> splits = stage_s.splits();
 
+    // Find all the predicated inner variables. We can't split these.
+    set<string> predicated_vars;
+    for (const Split &split : splits) {
+        if (split.tail == TailStrategy::PredicateLoads || split.tail == TailStrategy::PredicateStores) {
+            predicated_vars.insert(split.inner);
+        }
+    }
+
     // Define the function args in terms of the loop variables using the splits
     for (const Split &split : splits) {
+        user_assert(predicated_vars.count(split.old_var) == 0)
+            << "Cannot split a loop variable resulting from a split using PredicateLoads or PredicateStores.";
+
         vector<ApplySplitResult> splits_result = apply_split(split, is_update, prefix, dim_extent_alignment);
 
+        // To ensure we substitute all indices used in call or provide,
+        // we need to substitute all lets in, so we correctly guard x in
+        // an example like let a = 2*x in a + f[a].
+        stmt = substitute_in_all_lets(stmt);
         for (const auto &res : splits_result) {
             if (res.is_substitution()) {
-                stmt = substitute(res.name, res.value, stmt);
+                stmt = graph_substitute(res.name, res.value, stmt);
+            } else if (res.is_substitution_in_calls()) {
+                stmt = substitute_in(res.name, res.value, true, false, stmt);
+            } else if (res.is_substitution_in_provides()) {
+                stmt = substitute_in(res.name, res.value, false, true, stmt);
+            } else if (res.is_predicate_calls()) {
+                stmt = add_predicates(res.value, true, false, stmt);
+            } else if (res.is_predicate_provides()) {
+                stmt = add_predicates(res.value, false, true, stmt);
             } else if (res.is_let()) {
                 stmt = LetStmt::make(res.name, res.value, stmt);
             } else {
@@ -132,6 +239,7 @@ Stmt build_loop_nest(
                 stmt = IfThenElse::make(res.value, stmt, Stmt());
             }
         }
+        stmt = common_subexpression_elimination(stmt);
     }
 
     // Order the Ifs, Fors, and Lets for bounds inference
@@ -206,6 +314,9 @@ Stmt build_loop_nest(
         // Only push up LetStmts.
         internal_assert(nest[i].value.defined());
         internal_assert(nest[i].type == Container::Let);
+        if (!is_pure(nest[i].value)) {
+            continue;
+        }
 
         for (int j = i - 1; j >= 0; j--) {
             // Try to push it up by one.
@@ -366,7 +477,7 @@ Stmt build_provide_loop_nest(const map<string, Function> &env,
     }
 
     // Make the (multi-dimensional multi-valued) store node.
-    Stmt body = Provide::make(func.name(), values, site);
+    Stmt body = Provide::make(func.name(), values, site, const_true());
     if (def.schedule().atomic()) {  // Add atomic node.
         bool any_unordered_parallel = false;
         for (const auto &d : def.schedule().dims()) {
@@ -672,6 +783,20 @@ Stmt build_extern_produce(const map<string, Function> &env, Function f, const Ta
     Stmt check = AssertStmt::make(EQ::make(result, 0), error);
 
     if (!cropped_buffers.empty()) {
+        // We need to check that all cropped buffers are non-null (since Call::buffer_crop can return nullptr)
+        for (const auto &p : cropped_buffers) {
+            Expr cropped = p.first;
+            Expr cropped_u64 = reinterpret(UInt(64), cropped);
+            Expr error = Call::make(Int(32), "halide_error_device_crop_failed", std::vector<Expr>(), Call::Extern);
+            Stmt assertion = AssertStmt::make(cropped_u64 != 0, error);
+
+            if (!is_no_op(pre_call)) {
+                pre_call = Block::make(pre_call, assertion);
+            } else {
+                pre_call = assertion;
+            }
+        }
+
         // We need to clean up the temporary crops we made for the
         // outputs in case any of them have device allocations.
         vector<Expr> cleanup_args;
@@ -1573,8 +1698,7 @@ private:
                     }
                     // Now that we are going to add a stage to the order, go over dependent nodes
                     // and decrease their dependency count.
-                    for (size_t k = 0; k < adj_list[i][stage_index[i]].size(); k++) {
-                        const auto &edge = adj_list[i][stage_index[i]][k];
+                    for (auto &edge : adj_list[i][stage_index[i]]) {
                         internal_assert(stage_dependencies[edge.func_index][edge.stage_index] > 0);
                         stage_dependencies[edge.func_index][edge.stage_index]--;
                     }
@@ -1683,7 +1807,7 @@ private:
 class ComputeLegalSchedules : public IRVisitor {
 public:
     struct Site {
-        bool is_parallel;
+        bool is_parallel, is_gpu_block;
         LoopLevel loop_level;
     };
     vector<Site> sites_allowed;
@@ -1702,8 +1826,6 @@ private:
     const map<string, Function> &env;
 
     void visit(const For *f) override {
-        f->min.accept(this);
-        f->extent.accept(this);
         size_t first_dot = f->name.find('.');
         size_t last_dot = f->name.rfind('.');
         internal_assert(first_dot != string::npos && last_dot != string::npos);
@@ -1721,9 +1843,13 @@ private:
         // Since we are now in the lowering phase, we expect all LoopLevels to be locked;
         // thus any new ones we synthesize we must explicitly lock.
         loop_level.lock();
-        Site s = {f->is_parallel(), loop_level};
-        sites.push_back(s);
+        const bool is_gpu_block = (f->for_type == ForType::GPUBlock);
+        sites.push_back({f->is_parallel(), is_gpu_block, loop_level});
+
+        f->min.accept(this);
+        f->extent.accept(this);
         f->body.accept(this);
+
         sites.pop_back();
     }
 
@@ -1954,12 +2080,12 @@ bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_
             const Definition &r = f.update((int)i);
             if (!r.schedule().touched()) {
                 user_warning
-                    << "Warning: Update step " << i
+                    << "Update definition " << i
                     << " of function " << f.name()
                     << " has not been scheduled, even though some other"
-                    << " steps have been. You may have forgotten to"
+                    << " definitions have been. You may have forgotten to"
                     << " schedule it. If this was intentional, call "
-                    << f.name() << ".update(" << i << ") to suppress"
+                    << f.name() << ".update(" << i << ").unscheduled() to suppress"
                     << " this warning.\n";
             }
         }
@@ -2086,36 +2212,76 @@ bool validate_schedule(Function f, const Stmt &s, const Target &target, bool is_
         return true;
     }
 
-    bool store_at_ok = false, compute_at_ok = false;
-    const vector<ComputeLegalSchedules::Site> &sites = legal.sites_allowed;
-    size_t store_idx = 0, compute_idx = 0;
+    vector<ComputeLegalSchedules::Site> &sites = legal.sites_allowed;
+    int store_idx = -1, compute_idx = -1;
     for (size_t i = 0; i < sites.size(); i++) {
         if (sites[i].loop_level.match(store_at)) {
-            store_at_ok = true;
             store_idx = i;
         }
-        if (sites[i].loop_level.match(compute_at)) {
-            compute_at_ok = store_at_ok;
+        if (sites[i].loop_level.match(compute_at) && store_idx >= 0) {
             compute_idx = i;
         }
     }
 
-    // Check there isn't a parallel loop between the compute_at and the store_at
     std::ostringstream err;
 
-    if (store_at_ok && compute_at_ok) {
-        for (size_t i = store_idx + 1; i <= compute_idx; i++) {
+    // If you're compute_at() inside a gpu blocks loop, you can't have a gpu blocks loop yourself
+    const auto has_gpu_blocks = [&]() {
+        for (const Dim &d : f.definition().schedule().dims()) {
+            if (d.for_type == ForType::GPUBlock) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto both_ok = [&]() {
+        return store_idx >= 0 && compute_idx >= 0;
+    };
+
+    if (both_ok() && has_gpu_blocks()) {
+        for (int i = 0; i <= compute_idx; i++) {
+            if (sites[i].is_gpu_block) {
+                string site_fname = sites[i].loop_level.func();
+                user_error << "Functions that are compute_at() a gpu_block() loop cannot have their own gpu_block() loops, "
+                           << "but Func \"" << f.name() << "\" is compute_at() \"" << site_fname << "\"\n";
+            }
+        }
+    }
+
+    // If you're compute_at() a var marked as a gpu block var, it must be the innermost one
+    if (both_ok() && sites[compute_idx].is_gpu_block) {
+        string compute_at_fname = sites[compute_idx].loop_level.func();
+        int possibly_invalid_idx = compute_idx;
+        for (int i = compute_idx + 1; i < (int)sites.size(); i++) {
+            if (!sites[i].is_gpu_block) {
+                continue;
+            }
+            string site_fname = sites[i].loop_level.func();
+            if (site_fname == compute_at_fname) {
+                err << "Functions that are compute_at() a gpu_block() loop must specify the innermost gpu_block() loop for that Func.\n";
+                sites.erase(sites.begin() + possibly_invalid_idx);
+                // This one will also be invalid if we find a subsequent loop from the same func
+                possibly_invalid_idx = i;
+                store_idx = compute_idx = -1;
+            }
+        }
+    }
+
+    // Check there isn't a parallel loop between the compute_at and the store_at
+    if (both_ok()) {
+        for (int i = store_idx + 1; i <= compute_idx; i++) {
             if (sites[i].is_parallel) {
                 err << "Func \"" << f.name()
                     << "\" is stored outside the parallel loop over "
                     << sites[i].loop_level.to_string()
                     << " but computed within it. This is a potential race condition.\n";
-                store_at_ok = compute_at_ok = false;
+                store_idx = compute_idx = -1;
             }
         }
     }
 
-    if (!store_at_ok || !compute_at_ok) {
+    if (!both_ok()) {
         err << "Func \"" << f.name() << "\" is computed at the following invalid location:\n"
             << "  " << schedule_to_source(f, store_at, compute_at) << "\n"
             << "Legal locations for this function are:\n";
@@ -2245,9 +2411,18 @@ void validate_fused_groups_schedule(const vector<vector<string>> &fused_groups, 
 
             validate_fused_group_schedule_helper(
                 iter->first, 0, iter->second.definition(), env);
-            for (size_t i = 0; i < iter->second.updates().size(); ++i) {
+            for (const auto &s : iter->second.definition().specializations()) {
                 validate_fused_group_schedule_helper(
-                    iter->first, i + 1, iter->second.updates()[i], env);
+                    iter->first, 0, s.definition, env);
+            }
+            for (size_t i = 0; i < iter->second.updates().size(); ++i) {
+                const auto &update_stage = iter->second.updates()[i];
+                validate_fused_group_schedule_helper(
+                    iter->first, i + 1, update_stage, env);
+                for (const auto &s : update_stage.specializations()) {
+                    validate_fused_group_schedule_helper(
+                        iter->first, i + 1, s.definition, env);
+                }
             }
         }
     }

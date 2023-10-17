@@ -6,17 +6,11 @@
 
 using namespace Halide;
 
-#ifdef _WIN32
-#define DLLEXPORT __declspec(dllexport)
-#else
-#define DLLEXPORT
-#endif
-
 // External functions to track whether the cache is working.
 
 int call_count = 0;
 
-extern "C" DLLEXPORT int count_calls(halide_buffer_t *out) {
+extern "C" HALIDE_EXPORT_SYMBOL int count_calls(halide_buffer_t *out) {
     if (!out->is_bounds_query()) {
         call_count++;
         Halide::Runtime::Buffer<uint8_t>(*out).fill(42);
@@ -26,7 +20,7 @@ extern "C" DLLEXPORT int count_calls(halide_buffer_t *out) {
 
 int call_count_with_arg = 0;
 
-extern "C" DLLEXPORT int count_calls_with_arg(uint8_t val, halide_buffer_t *out) {
+extern "C" HALIDE_EXPORT_SYMBOL int count_calls_with_arg(uint8_t val, halide_buffer_t *out) {
     if (!out->is_bounds_query()) {
         call_count_with_arg++;
         Halide::Runtime::Buffer<uint8_t>(*out).fill(val);
@@ -36,7 +30,7 @@ extern "C" DLLEXPORT int count_calls_with_arg(uint8_t val, halide_buffer_t *out)
 
 int call_count_with_arg_parallel[8];
 
-extern "C" DLLEXPORT int count_calls_with_arg_parallel(uint8_t val, halide_buffer_t *out) {
+extern "C" HALIDE_EXPORT_SYMBOL int count_calls_with_arg_parallel(uint8_t val, halide_buffer_t *out) {
     if (!out->is_bounds_query()) {
         call_count_with_arg_parallel[out->dim[2].min]++;
         Halide::Runtime::Buffer<uint8_t>(*out).fill(val);
@@ -46,7 +40,7 @@ extern "C" DLLEXPORT int count_calls_with_arg_parallel(uint8_t val, halide_buffe
 
 int call_count_staged[4];
 
-extern "C" DLLEXPORT int count_calls_staged(int32_t stage, uint8_t val, halide_buffer_t *in, halide_buffer_t *out) {
+extern "C" HALIDE_EXPORT_SYMBOL int count_calls_staged(int32_t stage, uint8_t val, halide_buffer_t *in, halide_buffer_t *out) {
     if (in->is_bounds_query()) {
         for (int i = 0; i < out->dimensions; i++) {
             in->dim[i] = out->dim[i];
@@ -60,16 +54,16 @@ extern "C" DLLEXPORT int count_calls_staged(int32_t stage, uint8_t val, halide_b
     return 0;
 }
 
-extern "C" DLLEXPORT int computed_eviction_key(int a) {
+extern "C" HALIDE_EXPORT_SYMBOL int computed_eviction_key(int a) {
     return 2020 + a;
 }
 HalideExtern_1(int, computed_eviction_key, int);
 
-void simple_free(void *user_context, void *ptr) {
+void simple_free(JITUserContext *user_context, void *ptr) {
     free(ptr);
 }
 
-void *flakey_malloc(void * /* user_context */, size_t x) {
+void *flakey_malloc(JITUserContext * /* user_context */, size_t x) {
     if ((rand() % 4) == 0) {
         return nullptr;
     } else {
@@ -78,7 +72,7 @@ void *flakey_malloc(void * /* user_context */, size_t x) {
 }
 
 bool error_occured = false;
-void record_error(void *user_context, const char *msg) {
+void record_error(JITUserContext *user_context, const char *msg) {
     error_occured = true;
 }
 
@@ -586,7 +580,7 @@ int main(int argc, char **argv) {
     }
 
     if (get_jit_target_from_environment().arch == Target::WebAssembly) {
-        printf("[SKIP] WebAssembly JIT does not support set_custom_allocator().\n");
+        printf("[SKIP] WebAssembly JIT does not support custom allocators.\n");
         return 0;
     } else {
         // Test out of memory handling.
@@ -605,8 +599,9 @@ int main(int argc, char **argv) {
         g(x, y) = Tuple(f(x, y)[0] + f(x - 1, y)[0] + f(x + 1, y)[0], f(x, y)[1]);
 
         Pipeline pipe(g);
-        pipe.set_error_handler(record_error);
-        pipe.set_custom_allocator(flakey_malloc, simple_free);
+        pipe.jit_handlers().custom_error = record_error;
+        pipe.jit_handlers().custom_malloc = flakey_malloc;
+        pipe.jit_handlers().custom_free = simple_free;
 
         int total_errors = 0;
         int completed = 0;

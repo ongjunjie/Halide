@@ -33,6 +33,7 @@ public:
         CPlusPlusImplementation,
         CExternDecl,
         CPlusPlusExternDecl,
+        CPlusPlusFunctionInfoHeader,
     };
 
     /** Initialize a C code generator pointing at a particular output
@@ -65,9 +66,21 @@ protected:
 
     /** Emit a declaration. */
     // @{
-    virtual void compile(const LoweredFunc &func);
-    virtual void compile(const Buffer<> &buffer);
+    void compile(const LoweredFunc &func, const MetadataNameMap &metadata_name_map);
+    void compile(const Buffer<> &buffer);
     // @}
+
+    /** This is a hook that subclasses can use to transform a function body
+     * just before it is emitted -- e.g., to transform the IR to code that
+     * is easier to recognize and emit. The default implementation simply
+     * returns the input unchanged.
+     *
+     * This hook will always be called after the function declaration and
+     * opening brace is emitted, so in addition to (possibly) returning
+     * a modified Stmt, this function may also emit C++ code to the default
+     * stream if it wishes to add some prologue at the start of the function.
+     */
+    virtual Stmt preprocess_function_body(const Stmt &stmt);
 
     /** An ID for the most recently generated ssa variable */
     std::string id;
@@ -95,6 +108,7 @@ protected:
     void create_assertion(const std::string &id_cond, const Expr &message);
     void create_assertion(const Expr &cond, const Expr &message);
 
+    Expr scalarize_vector_reduce(const VectorReduce *op);
     enum AppendSpaceIfNeeded {
         DoNotAppendSpace,
         AppendSpace,
@@ -112,6 +126,9 @@ protected:
 
     /** Emit a version of a string that is a valid identifier in C (. is replaced with _) */
     virtual std::string print_name(const std::string &);
+
+    /** Add platform specific prologue */
+    virtual void add_platform_prologue();
 
     /** Add typedefs for vector types. Not needed for OpenCL, might
      * use different syntax for other C-like languages. */
@@ -132,7 +149,8 @@ protected:
     /** Return true if only generating an interface, which may be extern "C" or C++ */
     bool is_header() {
         return output_kind == CHeader ||
-               output_kind == CPlusPlusHeader;
+               output_kind == CPlusPlusHeader ||
+               output_kind == CPlusPlusFunctionInfoHeader;
     }
 
     /** Return true if only generating an interface, which may be extern "C" or C++ */
@@ -150,7 +168,8 @@ protected:
     bool is_c_plus_plus_interface() {
         return output_kind == CPlusPlusHeader ||
                output_kind == CPlusPlusImplementation ||
-               output_kind == CPlusPlusExternDecl;
+               output_kind == CPlusPlusExternDecl ||
+               output_kind == CPlusPlusFunctionInfoHeader;
     }
 
     /** Open a new C scope (i.e. throw in a brace, increase the indent) */
@@ -195,6 +214,7 @@ protected:
     void visit(const StringImm *) override;
     void visit(const FloatImm *) override;
     void visit(const Cast *) override;
+    void visit(const Reinterpret *) override;
     void visit(const Add *) override;
     void visit(const Sub *) override;
     void visit(const Mul *) override;
@@ -233,6 +253,7 @@ protected:
     void visit(const Fork *) override;
     void visit(const Acquire *) override;
     void visit(const Atomic *) override;
+    void visit(const VectorReduce *) override;
 
     void visit_binop(Type t, const Expr &a, const Expr &b, const char *op);
     void visit_relop(Type t, const Expr &a, const Expr &b, const char *scalar_op, const char *vector_op);
@@ -263,6 +284,23 @@ protected:
 
     /** true if add_vector_typedefs() has been called. */
     bool using_vector_typedefs;
+
+    /** Some architectures have private memory for the call stack; this
+     * means a thread cannot hand pointers to stack memory to another
+     * thread. Returning true here flag forces heap allocation of
+     * things that might be shared, such as closures and any buffer
+     * that may be used in a parallel context. */
+    virtual bool is_stack_private_to_thread() const;
+
+    void emit_argv_wrapper(const std::string &function_name,
+                           const std::vector<LoweredArgument> &args);
+    void emit_metadata_getter(const std::string &function_name,
+                              const std::vector<LoweredArgument> &args,
+                              const MetadataNameMap &metadata_name_map);
+    void emit_constexpr_function_info(const std::string &function_name,
+                                      const std::vector<LoweredArgument> &args,
+                                      const MetadataNameMap &metadata_name_map);
+    void emit_halide_free_helper(const std::string &alloc_name, const std::string &free_function);
 };
 
 }  // namespace Internal

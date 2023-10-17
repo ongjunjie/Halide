@@ -1,7 +1,8 @@
 #include "Halide.h"
+#include "test_sharding.h"
+
 #include <algorithm>
 #include <cmath>
-#include <future>
 #include <math.h>
 #include <random>
 #include <stdio.h>
@@ -347,13 +348,7 @@ bool test(int lanes, int seed) {
     }
 
     // Extern function call
-    // Skip the hypot() test for LLVM10: on machines with AVX2, the accuracy
-    // of the generated code deviates outside the expected error range for
-    // some cases. Since this is no longer the case in LLVM11+ (and Halide
-    // support for LLVM10 is in bug-fix mode only), we'll just skip this entirely
-    // for LLVM10, rather than try to tweak the error detection to deal with
-    // this corner case.
-    if (Halide::Internal::get_llvm_version() >= 110) {
+    {
         if (verbose) printf("External call to hypot\n");
         Func f8;
         f8(x, y) = hypot(1.1f, cast<float>(input(x, y)));
@@ -719,32 +714,42 @@ bool test(int lanes, int seed) {
 }
 
 int main(int argc, char **argv) {
-
     int seed = argc > 1 ? atoi(argv[1]) : time(nullptr);
     std::cout << "vector_math test seed: " << seed << std::endl;
 
+    struct Task {
+        std::function<bool(int, int)> fn;
+        int lanes;
+        int seed;
+    };
+
     // Only native vector widths - llvm doesn't handle others well
-    Halide::Internal::ThreadPool<bool> pool;
-    std::vector<std::future<bool>> futures;
-    futures.push_back(pool.async(test<float>, 4, seed));
-    futures.push_back(pool.async(test<float>, 8, seed));
-    futures.push_back(pool.async(test<double>, 2, seed));
-    futures.push_back(pool.async(test<uint8_t>, 16, seed));
-    futures.push_back(pool.async(test<int8_t>, 16, seed));
-    futures.push_back(pool.async(test<uint16_t>, 8, seed));
-    futures.push_back(pool.async(test<int16_t>, 8, seed));
-    futures.push_back(pool.async(test<uint32_t>, 4, seed));
-    futures.push_back(pool.async(test<int32_t>, 4, seed));
-    futures.push_back(pool.async(test<bfloat16_t>, 8, seed));
-    futures.push_back(pool.async(test<bfloat16_t>, 16, seed));
-    futures.push_back(pool.async(test<float16_t>, 8, seed));
-    futures.push_back(pool.async(test<float16_t>, 16, seed));
-    bool ok = true;
-    for (auto &f : futures) {
-        ok &= f.get();
+    std::vector<Task> tasks = {
+        {test<float>, 4, seed},
+        {test<float>, 8, seed},
+        {test<double>, 2, seed},
+        {test<uint8_t>, 16, seed},
+        {test<int8_t>, 16, seed},
+        {test<uint16_t>, 8, seed},
+        {test<int16_t>, 8, seed},
+        {test<uint32_t>, 4, seed},
+        {test<int32_t>, 4, seed},
+        {test<bfloat16_t>, 8, seed},
+        {test<bfloat16_t>, 16, seed},
+        {test<float16_t>, 8, seed},
+        {test<float16_t>, 16, seed},
+    };
+
+    using Sharder = Halide::Internal::Test::Sharder;
+    Sharder sharder;
+    for (size_t t = 0; t < tasks.size(); t++) {
+        if (!sharder.should_run(t)) continue;
+        const auto &task = tasks.at(t);
+        if (!task.fn(task.lanes, task.seed)) {
+            exit(1);
+        }
     }
 
-    if (!ok) return -1;
     printf("Success!\n");
     return 0;
 }

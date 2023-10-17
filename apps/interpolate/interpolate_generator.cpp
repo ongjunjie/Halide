@@ -14,8 +14,8 @@ class Interpolate : public Halide::Generator<Interpolate> {
 public:
     GeneratorParam<int> levels{"levels", 10};
 
-    Input<Buffer<float>> input{"input", 3};
-    Output<Buffer<float>> output{"output", 3};
+    Input<Buffer<float, 3>> input{"input"};
+    Output<Buffer<float, 3>> output{"output"};
 
     void generate() {
         Var x("x"), y("y"), c("c");
@@ -72,7 +72,7 @@ public:
         normalize(x, y, c) = interpolated[0](x, y, c) / interpolated[0](x, y, 3);
 
         // Schedule
-        if (auto_schedule) {
+        if (using_autoscheduler()) {
             output = normalize;
         } else {
             // 0.86ms on a 2060 RTX

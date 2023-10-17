@@ -93,8 +93,8 @@ private:
             return expr;
         }
 
-        for (size_t i = 0; i < free_vars.size(); i++) {
-            if (var_name == free_vars[i].name()) {
+        for (auto &free_var : free_vars) {
+            if (var_name == free_var.name()) {
                 return expr;
             }
         }
@@ -156,8 +156,8 @@ Expr saturating_sum(const RDom &r, Expr e, const Func &f) {
 
     user_assert(v.rdom.defined()) << "Expression passed to saturating_sum must reference a reduction domain";
 
-    f(v.free_vars) = 0;
-    f(v.free_vars) = Internal::saturating_add(f(v.free_vars), e);
+    f(v.free_vars) = cast(e.type(), 0);
+    f(v.free_vars) = saturating_add(f(v.free_vars), e);
     return f(v.call_args);
 }
 

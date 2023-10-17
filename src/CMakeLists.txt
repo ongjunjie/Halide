@@ -4,7 +4,9 @@
 
 # The externally-visible header files that go into making Halide.h.
 # Don't include anything here that includes llvm headers.
+# Also *don't* include anything that's only used internally (eg SpirvIR.h).
 set(HEADER_FILES
+    AbstractGenerator.h
     AddAtomicMutex.h
     AddImageChecks.h
     AddParameterChecks.h
@@ -21,7 +23,9 @@ set(HEADER_FILES
     BoundsInference.h
     BoundSmallAllocations.h
     Buffer.h
+    Callable.h
     CanonicalizeGPUVars.h
+    ClampUnsafeAccesses.h
     Closure.h
     CodeGen_C.h
     CodeGen_D3D12Compute_Dev.h
@@ -35,6 +39,8 @@ set(HEADER_FILES
     CodeGen_PTX_Dev.h
     CodeGen_PyTorch.h
     CodeGen_Targets.h
+    CodeGen_Vulkan_Dev.h
+    CodeGen_WebGPU_Dev.h
     CompilerLogger.h
     ConciseCasts.h
     CPlusPlusMangle.h
@@ -59,6 +65,7 @@ set(HEADER_FILES
     ExprUsesVar.h
     Extern.h
     ExternFuncArgument.h
+    ExtractTileOperations.h
     FastIntegerDivide.h
     FindCalls.h
     FindIntrinsics.h
@@ -96,15 +103,16 @@ set(HEADER_FILES
     LLVM_Runtime_Linker.h
     LoopCarry.h
     Lower.h
+    LowerParallelTasks.h
     LowerWarpShuffles.h
     MainPage.h
-    MatlabWrapper.h
     Memoization.h
     Module.h
     ModulusRemainder.h
     Monotonic.h
     ObjectInstanceRegistry.h
     OffloadGPULoops.h
+    OptimizeShuffles.h
     OutputImageParam.h
     ParallelRVar.h
     Param.h
@@ -140,13 +148,13 @@ set(HEADER_FILES
     SlidingWindow.h
     Solve.h
     SplitTuples.h
-    StmtToHtml.h
+    StageStridedLoads.h
+    StmtToViz.h
     StorageFlattening.h
     StorageFolding.h
     StrictifyFloat.h
     Substitute.h
     Target.h
-    ThreadPool.h
     Tracing.h
     TrimNoOps.h
     Tuple.h
@@ -164,6 +172,7 @@ set(HEADER_FILES
     )
 
 set(SOURCE_FILES
+    AbstractGenerator.cpp
     AddAtomicMutex.cpp
     AddImageChecks.cpp
     AddParameterChecks.cpp
@@ -180,7 +189,9 @@ set(SOURCE_FILES
     BoundsInference.cpp
     BoundSmallAllocations.cpp
     Buffer.cpp
+    Callable.cpp
     CanonicalizeGPUVars.cpp
+    ClampUnsafeAccesses.cpp
     Closure.cpp
     CodeGen_ARM.cpp
     CodeGen_C.cpp
@@ -190,7 +201,6 @@ set(SOURCE_FILES
     CodeGen_Internal.cpp
     CodeGen_LLVM.cpp
     CodeGen_Metal_Dev.cpp
-    CodeGen_MIPS.cpp
     CodeGen_OpenCL_Dev.cpp
     CodeGen_OpenGLCompute_Dev.cpp
     CodeGen_Posix.cpp
@@ -198,7 +208,9 @@ set(SOURCE_FILES
     CodeGen_PTX_Dev.cpp
     CodeGen_PyTorch.cpp
     CodeGen_RISCV.cpp
+    CodeGen_Vulkan_Dev.cpp
     CodeGen_WebAssembly.cpp
+    CodeGen_WebGPU_Dev.cpp
     CodeGen_X86.cpp
     CompilerLogger.cpp
     CPlusPlusMangle.cpp
@@ -219,6 +231,7 @@ set(SOURCE_FILES
     EmulateFloat16Math.cpp
     Error.cpp
     Expr.cpp
+    ExtractTileOperations.cpp
     FastIntegerDivide.cpp
     FindCalls.cpp
     FindIntrinsics.cpp
@@ -254,14 +267,15 @@ set(SOURCE_FILES
     LLVM_Runtime_Linker.cpp
     LoopCarry.cpp
     Lower.cpp
+    LowerParallelTasks.cpp
     LowerWarpShuffles.cpp
-    MatlabWrapper.cpp
     Memoization.cpp
     Module.cpp
     ModulusRemainder.cpp
     Monotonic.cpp
     ObjectInstanceRegistry.cpp
     OffloadGPULoops.cpp
+    OptimizeShuffles.cpp
     OutputImageParam.cpp
     ParallelRVar.cpp
     Parameter.cpp
@@ -291,6 +305,7 @@ set(SOURCE_FILES
     Simplify_Add.cpp
     Simplify_And.cpp
     Simplify_Call.cpp
+    Simplify_Reinterpret.cpp
     Simplify_Cast.cpp
     Simplify_Div.cpp
     Simplify_EQ.cpp
@@ -312,8 +327,10 @@ set(SOURCE_FILES
     SkipStages.cpp
     SlidingWindow.cpp
     Solve.cpp
+    SpirvIR.cpp
     SplitTuples.cpp
-    StmtToHtml.cpp
+    StageStridedLoads.cpp
+    StmtToViz.cpp
     StorageFlattening.cpp
     StorageFolding.cpp
     StrictifyFloat.cpp
@@ -335,11 +352,49 @@ set(SOURCE_FILES
     WrapCalls.cpp
     )
 
+set(C_TEMPLATE_FILES
+    CodeGen_C_prologue
+    CodeGen_C_vectors
+    )
+
+set(HTML_TEMPLATE_FILES
+    StmtToViz_dependencies
+    StmtToViz_javascript
+    StmtToViz_stylesheet
+    )
+
 ##
 # Build and import the runtime.
 ##
 
 add_subdirectory(runtime)
+
+##
+# Build the template files via binary2cpp.
+##
+
+add_library(Halide_c_templates OBJECT)
+foreach (f IN LISTS C_TEMPLATE_FILES)
+    set(SRC "$<SHELL_PATH:${CMAKE_CURRENT_SOURCE_DIR}/${f}.template.cpp>")
+    set(DST "c_template.${f}.template.cpp")
+
+    add_custom_command(OUTPUT "${DST}"
+                       COMMAND binary2cpp "halide_c_template_${f}" < "${SRC}" > "${DST}"
+                       DEPENDS "${SRC}" binary2cpp
+                       VERBATIM)
+    target_sources(Halide_c_templates PRIVATE ${DST})
+endforeach ()
+
+foreach (f IN LISTS HTML_TEMPLATE_FILES)
+    set(SRC "$<SHELL_PATH:${CMAKE_CURRENT_SOURCE_DIR}/irvisualizer/${f}.template.html>")
+    set(DST "html_template.${f}.template.cpp")
+
+    add_custom_command(OUTPUT "${DST}"
+                       COMMAND binary2cpp "halide_html_template_${f}" < "${SRC}" > "${DST}"
+                       DEPENDS "${SRC}" binary2cpp
+                       VERBATIM)
+    target_sources(Halide_c_templates PRIVATE ${DST})
+endforeach ()
 
 ##
 # Build the Halide mono-header.
@@ -363,13 +418,14 @@ add_library(Halide
             ${SOURCE_FILES}
             ${HEADER_FILES}
             # Including these as sources works around the need to "install" Halide_initmod
-            $<TARGET_OBJECTS:Halide_initmod>)
+            $<TARGET_OBJECTS:Halide_initmod>
+            $<TARGET_OBJECTS:Halide_c_templates>)
 add_library(Halide::Halide ALIAS Halide)
 
 target_link_libraries(Halide PRIVATE Halide::LLVM)
 target_link_libraries(Halide PUBLIC Halide::LanguageOptions)
 target_compile_definitions(Halide PRIVATE $<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,STATIC_LIBRARY>:Halide_STATIC_DEFINE>)
-target_compile_features(Halide PUBLIC cxx_std_11)
+target_compile_features(Halide PUBLIC cxx_std_17)
 
 include(TargetExportScript)
 ## TODO: implement something similar for Windows/link.exe
@@ -378,10 +434,21 @@ target_export_script(Halide
                      APPLE_LD "${CMAKE_CURRENT_LIST_DIR}/exported_symbols.osx"
                      GNU_LD "${CMAKE_CURRENT_LIST_DIR}/exported_symbols.ldscript")
 
+set(Halide_SOVERSION_OVERRIDE "${Halide_VERSION_MAJOR}"
+    CACHE STRING "SOVERSION to set for custom Halide packaging")
+mark_as_advanced(Halide_SOVERSION_OVERRIDE)
+
 set_target_properties(Halide PROPERTIES
                       POSITION_INDEPENDENT_CODE ON
                       VERSION ${Halide_VERSION}
-                      SOVERSION ${Halide_VERSION_MAJOR})
+                      SOVERSION ${Halide_SOVERSION_OVERRIDE})
+
+target_compile_definitions(Halide PUBLIC 
+                           HALIDE_VERSION=${Halide_VERSION} 
+                           HALIDE_VERSION_MAJOR=${Halide_VERSION_MAJOR}
+                           HALIDE_VERSION_MINOR=${Halide_VERSION_MINOR}
+                           HALIDE_VERSION_PATCH=${Halide_VERSION_PATCH})
+
 
 target_include_directories(Halide INTERFACE "$<BUILD_INTERFACE:${Halide_BINARY_DIR}/include>")
 add_dependencies(Halide HalideIncludes)
@@ -391,9 +458,14 @@ if (Halide_WITH_INTROSPECTION)
     target_compile_definitions(Halide PRIVATE WITH_INTROSPECTION)
 endif ()
 
-if (TARGET wabt-obj)
-    target_link_libraries(Halide PRIVATE wabt-obj)
+if (TARGET Halide_wabt)
+    target_link_libraries(Halide PRIVATE Halide_wabt)
     target_compile_definitions(Halide PRIVATE WITH_WABT)
+endif ()
+
+if (TARGET Halide_V8)
+    target_link_libraries(Halide PRIVATE Halide_V8)
+    target_compile_definitions(Halide PRIVATE WITH_V8)
 endif ()
 
 ##
@@ -413,8 +485,8 @@ target_compile_options(
 
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Winconsistent-missing-destructor-override>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Winconsistent-missing-override>
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wdeprecated-declarations>
 
-        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wno-deprecated-declarations>
         $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wno-double-promotion>
         $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wno-float-conversion>
         $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wno-float-equal>
@@ -443,13 +515,15 @@ target_compile_options(
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-missing-prototypes>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-nonportable-system-include-path>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-reserved-id-macro>
-        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-return-std-move-in-c++11>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-shadow-field-in-constructor>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-shadow-field>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-shorten-64-to-32>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-undefined-func-template>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-unused-member-function>
         $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-unused-template>
+
+        # This warning was removed in Clang 13
+        $<$<AND:$<CXX_COMPILER_ID:Clang,AppleClang>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,13.0>>:-Wno-return-std-move-in-c++11>
 
         $<$<CXX_COMPILER_ID:MSVC>:/W3>
         $<$<CXX_COMPILER_ID:MSVC>:/wd4018>  # 4018: disable "signed/unsigned mismatch"
@@ -460,7 +534,9 @@ target_compile_options(
         $<$<CXX_COMPILER_ID:MSVC>:/wd4291>  # 4291: No matching operator delete found
         $<$<CXX_COMPILER_ID:MSVC>:/wd4503>  # 4503: disable "decorated name length exceeded, name was truncated"
         $<$<CXX_COMPILER_ID:MSVC>:/wd4800>  # 4800: forcing value to bool 'true' or 'false' (performance warning)
-        $<$<CXX_COMPILER_ID:MSVC>:/wd4996>  # 4996: compiler encountered deprecated declaration
+
+        # No: enable deprecation warnings
+        # $<$<CXX_COMPILER_ID:MSVC>:/wd4996>  # 4996: compiler encountered deprecated declaration
 )
 
 if (CMAKE_GENERATOR MATCHES "Visual Studio")
@@ -502,6 +578,24 @@ option(TARGET_OPENGLCOMPUTE "Include OpenGLCompute target" ON)
 if (TARGET_OPENGLCOMPUTE)
     target_compile_definitions(Halide PRIVATE WITH_OPENGLCOMPUTE)
 endif ()
+
+if (TARGET_VULKAN)
+    message(STATUS "Enabling Vulkan target")
+    target_compile_definitions(Halide PRIVATE WITH_VULKAN)
+endif()
+
+if (TARGET_SPIRV)
+    # Our vendored SPIRV headers are only used internally; users do not need
+    # them installed.
+    target_compile_definitions(Halide PRIVATE WITH_SPIRV)
+    target_link_libraries(Halide PRIVATE "$<BUILD_INTERFACE:Halide::SPIRV>")
+endif ()
+
+option(TARGET_WEBGPU "Include WebGPU target" ON)
+if (TARGET_WEBGPU)
+    target_compile_definitions(Halide PRIVATE WITH_WEBGPU)
+endif()
+
 
 ##
 # Add autoschedulers to the build.

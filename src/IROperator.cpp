@@ -14,6 +14,8 @@
 #include "Util.h"
 #include "Var.h"
 
+using namespace Halide::Internal;
+
 namespace Halide {
 
 // Evaluate a float polynomial efficiently, taking instruction latency
@@ -57,11 +59,15 @@ Expr stringify(const std::vector<Expr> &args) {
         return Expr("");
     }
 
-    return Internal::Call::make(type_of<const char *>(), Internal::Call::stringify,
-                                args, Internal::Call::Intrinsic);
+    return Call::make(type_of<const char *>(), Call::stringify,
+                      args, Call::PureIntrinsic);
 }
 
 Expr combine_strings(const std::vector<Expr> &args) {
+    if (args.empty()) {
+        return Expr("");
+    }
+
     // Insert spaces between each expr.
     std::vector<Expr> strings(args.size() * 2);
     for (size_t i = 0; i < args.size(); i++) {
@@ -71,6 +77,20 @@ Expr combine_strings(const std::vector<Expr> &args) {
         } else {
             strings[i * 2 + 1] = Expr("\n");
         }
+    }
+
+    // Now combine all adjacent string literals, which is
+    // useful to reduce emitted code size when printing
+    size_t i = 0;
+    while (i < strings.size() - 1) {
+        const auto *cur_str = strings[i].as<StringImm>();
+        const auto *next_str = strings[i + 1].as<StringImm>();
+        if (cur_str && next_str) {
+            strings[i] = StringImm::make(cur_str->value + next_str->value);
+            strings.erase(strings.begin() + i + 1);
+            continue;
+        }
+        i++;
     }
 
     return stringify(strings);
@@ -118,7 +138,7 @@ bool is_no_op(const Stmt &s) {
         return true;
     }
     const Evaluate *e = s.as<Evaluate>();
-    return e && is_const(e->value);
+    return e && is_pure(e->value);
 }
 
 namespace {
@@ -400,6 +420,11 @@ Expr make_signed_integer_overflow(Type type) {
     return Call::make(type, Call::signed_integer_overflow, {counter++}, Call::Intrinsic);
 }
 
+bool is_signed_integer_overflow(const Expr &expr) {
+    const Call *call = expr.as<Call>();
+    return call && call->is_intrinsic(Call::signed_integer_overflow);
+}
+
 Expr const_true(int w) {
     return make_one(UInt(1, w));
 }
@@ -457,7 +482,7 @@ Expr lossless_cast(Type t, Expr e) {
         }
     }
 
-    if ((t.is_int() || t.is_uint()) && t.bits() >= 16) {
+    if (t.is_int_or_uint() && t.bits() >= 16) {
         if (const Add *add = e.as<Add>()) {
             // If we can losslessly narrow the args even more
             // aggressively, we're good.
@@ -1025,6 +1050,21 @@ struct RemoveLikelies : public IRMutator {
     }
 };
 
+// TODO: There could just be one IRMutator that can remove
+// calls from a list. If we need more of these, it might be worth
+// doing that refactor.
+struct RemovePromises : public IRMutator {
+    using IRMutator::visit;
+    Expr visit(const Call *op) override {
+        if (op->is_intrinsic(Call::promise_clamped) ||
+            op->is_intrinsic(Call::unsafe_promise_clamped)) {
+            return mutate(op->args[0]);
+        } else {
+            return IRMutator::visit(op);
+        }
+    }
+};
+
 }  // namespace
 
 Expr remove_likelies(const Expr &e) {
@@ -1035,6 +1075,14 @@ Stmt remove_likelies(const Stmt &s) {
     return RemoveLikelies().mutate(s);
 }
 
+Expr remove_promises(const Expr &e) {
+    return RemovePromises().mutate(e);
+}
+
+Stmt remove_promises(const Stmt &s) {
+    return RemovePromises().mutate(s);
+}
+
 Expr unwrap_tags(const Expr &e) {
     if (const Call *tag = Call::as_tag(e)) {
         return unwrap_tags(tag->args[0]);
@@ -1042,17 +1090,11 @@ Expr unwrap_tags(const Expr &e) {
     return e;
 }
 
-Expr predicate(Expr e) {
-    Type t = e.type();
-    return Internal::Call::make(t, Internal::Call::predicate,
-                                {std::move(e)}, Internal::Call::PureIntrinsic);
-}
-
 Expr requirement_failed_error(Expr condition, const std::vector<Expr> &args) {
-    return Internal::Call::make(Int(32),
-                                "halide_error_requirement_failed",
-                                {stringify({std::move(condition)}), combine_strings(args)},
-                                Internal::Call::Extern);
+    return Call::make(Int(32),
+                      "halide_error_requirement_failed",
+                      {stringify({std::move(condition)}), combine_strings(args)},
+                      Call::Extern);
 }
 
 Expr memoize_tag_helper(Expr result, const std::vector<Expr> &cache_key_values) {
@@ -1060,8 +1102,50 @@ Expr memoize_tag_helper(Expr result, const std::vector<Expr> &cache_key_values) 
     std::vector<Expr> args;
     args.push_back(std::move(result));
     args.insert(args.end(), cache_key_values.begin(), cache_key_values.end());
-    return Internal::Call::make(t, Internal::Call::memoize_expr,
-                                args, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::memoize_expr,
+                      args, Call::PureIntrinsic);
+}
+
+}  // namespace Internal
+
+Expr widen_right_add(Expr a, Expr b) {
+    user_assert(a.defined() && b.defined()) << "widen_right_add of undefined Expr\n"
+                                            << a << ", " << b << "\n";
+    user_assert(a.type().is_int_or_uint() && b.type().is_int_or_uint())
+        << "widen_right_add only defined for integer types, received:\n " << a << "\n " << b << "\n";
+    user_assert(b.type().bits() <= 32) << "widen_right_add of large Expr\n"
+                                       << a << ", " << b << "\n";
+    match_lanes(a, b);
+    Type wide_type = b.type().widen();
+    user_assert(wide_type == a.type()) << "widen_right_add type mismatch\n " << a << "\n " << b << "\n";
+    return Call::make(wide_type, Call::widen_right_add, {std::move(a), std::move(b)}, Call::PureIntrinsic);
+}
+
+Expr widen_right_mul(Expr a, Expr b) {
+    user_assert(a.defined() && b.defined()) << "widen_right_mul of undefined Expr\n"
+                                            << a << ", " << b << "\n";
+    user_assert(a.type().is_int_or_uint() && b.type().is_int_or_uint())
+        << "widen_right_mul only defined for integer types, received:\n " << a << "\n " << b << "\n";
+    user_assert(b.type().bits() <= 32) << "widen_right_mul of large Expr\n"
+                                       << a << ", " << b << "\n";
+    match_lanes(a, b);
+    Type wide_type = b.type().widen();
+    user_assert(wide_type == a.type()) << "widen_right_mul type mismatch\n " << a << "\n " << b << "\n";
+    return Call::make(wide_type, Call::widen_right_mul, {std::move(a), std::move(b)}, Call::PureIntrinsic);
+}
+
+Expr widen_right_sub(Expr a, Expr b) {
+    user_assert(a.defined() && b.defined()) << "widen_right_sub of undefined Expr\n"
+                                            << a << ", " << b << "\n";
+    user_assert(a.type().is_int_or_uint() && b.type().is_int_or_uint())
+        << "widen_right_sub only defined for integer types, received:\n " << a << "\n " << b << "\n";
+    user_assert(b.type().bits() <= 32) << "widen_right_sub of large Expr\n"
+                                       << a << ", " << b << "\n";
+    match_lanes(a, b);
+    Type wide_type = b.type().widen();
+    user_assert(wide_type == a.type()) << "widen_right_sub type mismatch\n"
+                                       << a << ", " << b << "\n";
+    return Call::make(wide_type, Call::widen_right_sub, {std::move(a), std::move(b)}, Call::PureIntrinsic);
 }
 
 Expr widening_add(Expr a, Expr b) {
@@ -1209,13 +1293,6 @@ Expr halving_sub(Expr a, Expr b) {
     return Call::make(result_type, Call::halving_sub, {std::move(a), std::move(b)}, Call::PureIntrinsic);
 }
 
-Expr rounding_halving_sub(Expr a, Expr b) {
-    user_assert(a.defined() && b.defined()) << "rounding_halving_sub of undefined Expr\n";
-    match_types(a, b);
-    Type result_type = a.type();
-    return Call::make(result_type, Call::rounding_halving_sub, {std::move(a), std::move(b)}, Call::PureIntrinsic);
-}
-
 Expr mul_shift_right(Expr a, Expr b, Expr q) {
     user_assert(a.defined() && b.defined() && q.defined()) << "mul_shift_right of undefined Expr\n";
     user_assert(q.type().is_uint()) << "mul_shift_right shift must be unsigned\n";
@@ -1253,8 +1330,6 @@ Expr rounding_mul_shift_right(Expr a, Expr b, int q) {
     check_representable(qt, q);
     return rounding_mul_shift_right(std::move(a), std::move(b), make_const(qt, q));
 }
-
-}  // namespace Internal
 
 Expr fast_log(const Expr &x) {
     user_assert(x.type() == Float(32)) << "fast_log only works for Float(32)";
@@ -1365,22 +1440,22 @@ Expr print(const std::vector<Expr> &args) {
 
     // Call halide_print.
     Expr print_call =
-        Internal::Call::make(Int(32), "halide_print",
-                             {combined_string}, Internal::Call::Extern);
+        Call::make(Int(32), "halide_print",
+                   {combined_string}, Call::Extern);
 
     // Return the first argument.
     Expr result =
-        Internal::Call::make(args[0].type(), Internal::Call::return_second,
-                             {print_call, args[0]}, Internal::Call::PureIntrinsic);
+        Call::make(args[0].type(), Call::return_second,
+                   {print_call, args[0]}, Call::PureIntrinsic);
     return result;
 }
 
 Expr print_when(Expr condition, const std::vector<Expr> &args) {
     Expr p = print(args);
-    return Internal::Call::make(p.type(),
-                                Internal::Call::if_then_else,
-                                {std::move(condition), p, args[0]},
-                                Internal::Call::PureIntrinsic);
+    return Call::make(p.type(),
+                      Call::if_then_else,
+                      {std::move(condition), p, args[0]},
+                      Call::PureIntrinsic);
 }
 
 Expr require(Expr condition, const std::vector<Expr> &args) {
@@ -1390,47 +1465,14 @@ Expr require(Expr condition, const std::vector<Expr> &args) {
 
     Expr err = requirement_failed_error(condition, args);
 
-    return Internal::Call::make(args[0].type(),
-                                Internal::Call::require,
-                                {likely(std::move(condition)), args[0], std::move(err)},
-                                Internal::Call::PureIntrinsic);
+    return Call::make(args[0].type(),
+                      Call::require,
+                      {likely(std::move(condition)), args[0], std::move(err)},
+                      Call::Intrinsic);
 }
 
 Expr saturating_cast(Type t, Expr e) {
-    // For float to float, guarantee infinities are always pinned to range.
-    if (t.is_float() && e.type().is_float()) {
-        if (t.bits() < e.type().bits()) {
-            e = cast(t, clamp(std::move(e), t.min(), t.max()));
-        } else {
-            e = clamp(cast(t, std::move(e)), t.min(), t.max());
-        }
-    } else if (e.type() != t) {
-        // Limits for Int(2^n) or UInt(2^n) are not exactly representable in Float(2^n)
-        if (e.type().is_float() && !t.is_float() && t.bits() >= e.type().bits()) {
-            e = max(std::move(e), t.min());  // min values turn out to be always representable
-
-            // This line depends on t.max() rounding upward, which should always
-            // be the case as it is one less than a representable value, thus
-            // the one larger is always the closest.
-            e = select(e >= cast(e.type(), t.max()), t.max(), cast(t, e));
-        } else {
-            Expr min_bound;
-            if (!e.type().is_uint()) {
-                min_bound = lossless_cast(e.type(), t.min());
-            }
-            Expr max_bound = lossless_cast(e.type(), t.max());
-
-            if (min_bound.defined() && max_bound.defined()) {
-                e = clamp(std::move(e), min_bound, max_bound);
-            } else if (min_bound.defined()) {
-                e = max(std::move(e), min_bound);
-            } else if (max_bound.defined()) {
-                e = min(std::move(e), max_bound);
-            }
-            e = cast(t, std::move(e));
-        }
-    }
-    return e;
+    return Call::make(t, Call::saturating_cast, {std::move(e)}, Call::PureIntrinsic);
 }
 
 Expr select(Expr condition, Expr true_value, Expr false_value) {
@@ -1456,7 +1498,7 @@ Expr select(Expr condition, Expr true_value, Expr false_value) {
         << "  " << true_value << " has type " << true_value.type() << "\n"
         << "  " << false_value << " has type " << false_value.type() << "\n";
 
-    return Internal::Select::make(std::move(condition), std::move(true_value), std::move(false_value));
+    return Select::make(std::move(condition), std::move(true_value), std::move(false_value));
 }
 
 Tuple tuple_select(const Tuple &condition, const Tuple &true_value, const Tuple &false_value) {
@@ -1494,7 +1536,7 @@ Expr mux(const Expr &id, const std::vector<Expr> &values) {
     }
     std::vector<Expr> result{id};
     result.insert(result.end(), values.begin(), values.end());
-    return Internal::Call::make(t, Internal::Call::mux, result, Internal::Call::Intrinsic);
+    return Call::make(t, Call::mux, result, Call::PureIntrinsic);
 }
 
 Expr mux(const Expr &id, const Tuple &tup) {
@@ -1512,10 +1554,10 @@ Expr unsafe_promise_clamped(const Expr &value, const Expr &min, const Expr &max)
 
     // Min and max are allowed to be undefined with the meaning of no bound on that side.
 
-    return Internal::Call::make(value.type(),
-                                Internal::Call::unsafe_promise_clamped,
-                                {value, n_min_val, n_max_val},
-                                Internal::Call::Intrinsic);
+    return Call::make(value.type(),
+                      Call::unsafe_promise_clamped,
+                      {value, n_min_val, n_max_val},
+                      Call::PureIntrinsic);
 }
 
 namespace Internal {
@@ -1525,270 +1567,270 @@ Expr promise_clamped(const Expr &value, const Expr &min, const Expr &max) {
     Expr n_max_val = max.defined() ? lossless_cast(value.type(), max) : value.type().max();
 
     // Min and max are allowed to be undefined with the meaning of no bound on that side.
-    return Internal::Call::make(value.type(),
-                                Internal::Call::promise_clamped,
-                                {value, n_min_val, n_max_val},
-                                Internal::Call::Intrinsic);
+    return Call::make(value.type(),
+                      Call::promise_clamped,
+                      {value, n_min_val, n_max_val},
+                      Call::PureIntrinsic);
 }
 }  // namespace Internal
 
 Expr operator+(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator+ of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::Add::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Add::make(std::move(a), std::move(b));
 }
 
 Expr operator+(Expr a, int b) {
     user_assert(a.defined()) << "operator+ of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::Add::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return Add::make(std::move(a), make_const(t, b));
 }
 
 Expr operator+(int a, Expr b) {
     user_assert(b.defined()) << "operator+ of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::Add::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return Add::make(make_const(t, a), std::move(b));
 }
 
 Expr &operator+=(Expr &a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator+= of undefined Expr\n";
     Type t = a.type();
-    a = Internal::Add::make(std::move(a), cast(t, std::move(b)));
+    a = Add::make(std::move(a), cast(t, std::move(b)));
     return a;
 }
 
 Expr operator-(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator- of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::Sub::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Sub::make(std::move(a), std::move(b));
 }
 
 Expr operator-(Expr a, int b) {
     user_assert(a.defined()) << "operator- of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::Sub::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return Sub::make(std::move(a), make_const(t, b));
 }
 
 Expr operator-(int a, Expr b) {
     user_assert(b.defined()) << "operator- of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::Sub::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return Sub::make(make_const(t, a), std::move(b));
 }
 
 Expr operator-(Expr a) {
     user_assert(a.defined()) << "operator- of undefined Expr\n";
     Type t = a.type();
-    return Internal::Sub::make(Internal::make_zero(t), std::move(a));
+    return Sub::make(make_zero(t), std::move(a));
 }
 
 Expr &operator-=(Expr &a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator-= of undefined Expr\n";
     Type t = a.type();
-    a = Internal::Sub::make(std::move(a), cast(t, std::move(b)));
+    a = Sub::make(std::move(a), cast(t, std::move(b)));
     return a;
 }
 
 Expr operator*(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator* of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::Mul::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Mul::make(std::move(a), std::move(b));
 }
 
 Expr operator*(Expr a, int b) {
     user_assert(a.defined()) << "operator* of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::Mul::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return Mul::make(std::move(a), make_const(t, b));
 }
 
 Expr operator*(int a, Expr b) {
     user_assert(b.defined()) << "operator* of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::Mul::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return Mul::make(make_const(t, a), std::move(b));
 }
 
 Expr &operator*=(Expr &a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator*= of undefined Expr\n";
     Type t = a.type();
-    a = Internal::Mul::make(std::move(a), cast(t, std::move(b)));
+    a = Mul::make(std::move(a), cast(t, std::move(b)));
     return a;
 }
 
 Expr operator/(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator/ of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::Div::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Div::make(std::move(a), std::move(b));
 }
 
 Expr &operator/=(Expr &a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator/= of undefined Expr\n";
     Type t = a.type();
-    a = Internal::Div::make(std::move(a), cast(t, std::move(b)));
+    a = Div::make(std::move(a), cast(t, std::move(b)));
     return a;
 }
 
 Expr operator/(Expr a, int b) {
     user_assert(a.defined()) << "operator/ of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::Div::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return Div::make(std::move(a), make_const(t, b));
 }
 
 Expr operator/(int a, Expr b) {
     user_assert(b.defined()) << "operator- of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::Div::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return Div::make(make_const(t, a), std::move(b));
 }
 
 Expr operator%(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator% of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::Mod::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Mod::make(std::move(a), std::move(b));
 }
 
 Expr operator%(Expr a, int b) {
     user_assert(a.defined()) << "operator% of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::Mod::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return Mod::make(std::move(a), make_const(t, b));
 }
 
 Expr operator%(int a, Expr b) {
     user_assert(b.defined()) << "operator% of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::Mod::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return Mod::make(make_const(t, a), std::move(b));
 }
 
 Expr operator>(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator> of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::GT::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return GT::make(std::move(a), std::move(b));
 }
 
 Expr operator>(Expr a, int b) {
     user_assert(a.defined()) << "operator> of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::GT::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return GT::make(std::move(a), make_const(t, b));
 }
 
 Expr operator>(int a, Expr b) {
     user_assert(b.defined()) << "operator> of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::GT::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return GT::make(make_const(t, a), std::move(b));
 }
 
 Expr operator<(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator< of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::LT::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return LT::make(std::move(a), std::move(b));
 }
 
 Expr operator<(Expr a, int b) {
     user_assert(a.defined()) << "operator< of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::LT::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return LT::make(std::move(a), make_const(t, b));
 }
 
 Expr operator<(int a, Expr b) {
     user_assert(b.defined()) << "operator< of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::LT::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return LT::make(make_const(t, a), std::move(b));
 }
 
 Expr operator<=(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator<= of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::LE::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return LE::make(std::move(a), std::move(b));
 }
 
 Expr operator<=(Expr a, int b) {
     user_assert(a.defined()) << "operator<= of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::LE::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return LE::make(std::move(a), make_const(t, b));
 }
 
 Expr operator<=(int a, Expr b) {
     user_assert(b.defined()) << "operator<= of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::LE::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return LE::make(make_const(t, a), std::move(b));
 }
 
 Expr operator>=(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator>= of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::GE::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return GE::make(std::move(a), std::move(b));
 }
 
 Expr operator>=(const Expr &a, int b) {
     user_assert(a.defined()) << "operator>= of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::GE::make(a, Internal::make_const(t, b));
+    check_representable(t, b);
+    return GE::make(a, make_const(t, b));
 }
 
 Expr operator>=(int a, const Expr &b) {
     user_assert(b.defined()) << "operator>= of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::GE::make(Internal::make_const(t, a), b);
+    check_representable(t, a);
+    return GE::make(make_const(t, a), b);
 }
 
 Expr operator==(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator== of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::EQ::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return EQ::make(std::move(a), std::move(b));
 }
 
 Expr operator==(Expr a, int b) {
     user_assert(a.defined()) << "operator== of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::EQ::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return EQ::make(std::move(a), make_const(t, b));
 }
 
 Expr operator==(int a, Expr b) {
     user_assert(b.defined()) << "operator== of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::EQ::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return EQ::make(make_const(t, a), std::move(b));
 }
 
 Expr operator!=(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "operator!= of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::NE::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return NE::make(std::move(a), std::move(b));
 }
 
 Expr operator!=(Expr a, int b) {
     user_assert(a.defined()) << "operator!= of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::NE::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return NE::make(std::move(a), make_const(t, b));
 }
 
 Expr operator!=(int a, Expr b) {
     user_assert(b.defined()) << "operator!= of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::NE::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return NE::make(make_const(t, a), std::move(b));
 }
 
 Expr operator&&(Expr a, Expr b) {
-    Internal::match_types(a, b);
-    return Internal::And::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return And::make(std::move(a), std::move(b));
 }
 
 Expr operator&&(Expr a, bool b) {
@@ -1797,7 +1839,7 @@ Expr operator&&(Expr a, bool b) {
     if (b) {
         return a;
     } else {
-        return Internal::make_zero(a.type());
+        return make_zero(a.type());
     }
 }
 
@@ -1806,15 +1848,15 @@ Expr operator&&(bool a, Expr b) {
 }
 
 Expr operator||(Expr a, Expr b) {
-    Internal::match_types(a, b);
-    return Internal::Or::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Or::make(std::move(a), std::move(b));
 }
 
 Expr operator||(Expr a, bool b) {
     internal_assert(a.defined()) << "operator|| of undefined Expr\n";
     internal_assert(a.type().is_bool()) << "operator|| of Expr of type " << a.type() << "\n";
     if (b) {
-        return Internal::make_one(a.type());
+        return make_one(a.type());
     } else {
         return a;
     }
@@ -1825,49 +1867,49 @@ Expr operator||(bool a, Expr b) {
 }
 
 Expr operator!(Expr a) {
-    return Internal::Not::make(std::move(a));
+    return Not::make(std::move(a));
 }
 
 Expr max(Expr a, Expr b) {
     user_assert(a.defined() && b.defined())
         << "max of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::Max::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Max::make(std::move(a), std::move(b));
 }
 
 Expr max(Expr a, int b) {
     user_assert(a.defined()) << "max of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::Max::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return Max::make(std::move(a), make_const(t, b));
 }
 
 Expr max(int a, Expr b) {
     user_assert(b.defined()) << "max of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::Max::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return Max::make(make_const(t, a), std::move(b));
 }
 
 Expr min(Expr a, Expr b) {
     user_assert(a.defined() && b.defined())
         << "min of undefined Expr\n";
-    Internal::match_types(a, b);
-    return Internal::Min::make(std::move(a), std::move(b));
+    match_types(a, b);
+    return Min::make(std::move(a), std::move(b));
 }
 
 Expr min(Expr a, int b) {
     user_assert(a.defined()) << "max of undefined Expr\n";
     Type t = a.type();
-    Internal::check_representable(t, b);
-    return Internal::Min::make(std::move(a), Internal::make_const(t, b));
+    check_representable(t, b);
+    return Min::make(std::move(a), make_const(t, b));
 }
 
 Expr min(int a, Expr b) {
     user_assert(b.defined()) << "max of undefined Expr\n";
     Type t = b.type();
-    Internal::check_representable(t, a);
-    return Internal::Min::make(Internal::make_const(t, a), std::move(b));
+    check_representable(t, a);
+    return Min::make(make_const(t, a), std::move(b));
 }
 
 Expr cast(Type t, Expr a) {
@@ -1888,24 +1930,33 @@ Expr cast(Type t, Expr a) {
 
     // Fold constants early
     if (const int64_t *i = as_const_int(a)) {
-        return Internal::make_const(t, *i);
+        return make_const(t, *i);
     }
     if (const uint64_t *u = as_const_uint(a)) {
-        return Internal::make_const(t, *u);
+        return make_const(t, *u);
     }
     if (const double *f = as_const_float(a)) {
-        return Internal::make_const(t, *f);
+        return make_const(t, *f);
     }
 
     if (t.is_vector()) {
         if (a.type().is_scalar()) {
-            return Internal::Broadcast::make(cast(t.element_of(), std::move(a)), t.lanes());
-        } else if (const Internal::Broadcast *b = a.as<Internal::Broadcast>()) {
-            internal_assert(b->lanes == t.lanes());
-            return Internal::Broadcast::make(cast(t.element_of(), b->value), t.lanes());
+            return Broadcast::make(cast(t.element_of(), std::move(a)), t.lanes());
+        } else if (const Broadcast *b = a.as<Broadcast>()) {
+            if (b->lanes == t.lanes()) {
+                return Broadcast::make(cast(t.element_of(), b->value), t.lanes());
+            }
+            // else fall thru: we could have a situation like
+            //
+            //   a=x3(ramp(x, y, 2))  # type=uint32x6
+            //   t=uint1x6
+            //
+            // this should be legal to cast, but requiring b->lanes == t.lanes
+            // would make it fail. Just fall through and let the Cast IR node
+            // deal with possible errors. (https://github.com/halide/Halide/issues/7556)
         }
     }
-    return Internal::Cast::make(t, std::move(a));
+    return Cast::make(t, std::move(a));
 }
 
 Expr clamp(Expr a, const Expr &min_val, const Expr &max_val) {
@@ -1921,7 +1972,7 @@ Expr clamp(Expr a, const Expr &min_val, const Expr &max_val) {
         << "Type mismatch in call to clamp. First argument ("
         << a << ") has type " << a.type() << ", but third argument ("
         << max_val << ") has type " << max_val.type() << ". Use an explicit cast.\n";
-    return Internal::Max::make(Internal::Min::make(std::move(a), std::move(n_max_val)), std::move(n_min_val));
+    return Max::make(Min::make(std::move(a), std::move(n_max_val)), std::move(n_min_val));
 }
 
 Expr abs(Expr a) {
@@ -1932,13 +1983,13 @@ Expr abs(Expr a) {
         user_warning << "Warning: abs of an unsigned type is a no-op\n";
         return a;
     }
-    return Internal::Call::make(t.with_code(t.is_int() ? Type::UInt : t.code()),
-                                Internal::Call::abs, {std::move(a)}, Internal::Call::PureIntrinsic);
+    return Call::make(t.with_code(t.is_int() ? Type::UInt : t.code()),
+                      Call::abs, {std::move(a)}, Call::PureIntrinsic);
 }
 
 Expr absd(Expr a, Expr b) {
     user_assert(a.defined() && b.defined()) << "absd of undefined Expr\n";
-    Internal::match_types(a, b);
+    match_types(a, b);
     Type t = a.type();
 
     if (t.is_float()) {
@@ -1947,74 +1998,74 @@ Expr absd(Expr a, Expr b) {
     }
 
     // The argument may be signed, but the return type is unsigned.
-    return Internal::Call::make(t.with_code(t.is_int() ? Type::UInt : t.code()),
-                                Internal::Call::absd, {std::move(a), std::move(b)},
-                                Internal::Call::PureIntrinsic);
+    return Call::make(t.with_code(t.is_int() ? Type::UInt : t.code()),
+                      Call::absd, {std::move(a), std::move(b)},
+                      Call::PureIntrinsic);
 }
 
 Expr sin(Expr x) {
     user_assert(x.defined()) << "sin of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "sin_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "sin_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "sin_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "sin_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "sin_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "sin_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr asin(Expr x) {
     user_assert(x.defined()) << "asin of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "asin_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "asin_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "asin_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "asin_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "asin_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "asin_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr cos(Expr x) {
     user_assert(x.defined()) << "cos of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "cos_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "cos_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "cos_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "cos_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "cos_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "cos_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr acos(Expr x) {
     user_assert(x.defined()) << "acos of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "acos_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "acos_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "acos_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "acos_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "acos_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "acos_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr tan(Expr x) {
     user_assert(x.defined()) << "tan of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "tan_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "tan_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "tan_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "tan_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "tan_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "tan_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr atan(Expr x) {
     user_assert(x.defined()) << "atan of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "atan_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "atan_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "atan_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "atan_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "atan_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "atan_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2023,91 +2074,91 @@ Expr atan2(Expr y, Expr x) {
 
     if (y.type() == Float(64)) {
         x = cast<double>(x);
-        return Internal::Call::make(Float(64), "atan2_f64", {std::move(y), std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "atan2_f64", {std::move(y), std::move(x)}, Call::PureExtern);
     } else if (y.type() == Float(16)) {
         x = cast<float16_t>(x);
-        return Internal::Call::make(Float(16), "atan2_f16", {std::move(y), std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "atan2_f16", {std::move(y), std::move(x)}, Call::PureExtern);
     } else {
         y = cast<float>(y);
         x = cast<float>(x);
-        return Internal::Call::make(Float(32), "atan2_f32", {std::move(y), std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "atan2_f32", {std::move(y), std::move(x)}, Call::PureExtern);
     }
 }
 
 Expr sinh(Expr x) {
     user_assert(x.defined()) << "sinh of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "sinh_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "sinh_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "sinh_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "sinh_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "sinh_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "sinh_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr asinh(Expr x) {
     user_assert(x.defined()) << "asinh of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "asinh_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "asinh_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "asinh_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "asinh_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "asinh_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "asinh_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr cosh(Expr x) {
     user_assert(x.defined()) << "cosh of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "cosh_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "cosh_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "cosh_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "cosh_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "cosh_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "cosh_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr acosh(Expr x) {
     user_assert(x.defined()) << "acosh of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "acosh_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "acosh_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "acosh_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "acosh_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "acosh_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "acosh_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr tanh(Expr x) {
     user_assert(x.defined()) << "tanh of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "tanh_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "tanh_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "tanh_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "tanh_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "tanh_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "tanh_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr atanh(Expr x) {
     user_assert(x.defined()) << "atanh of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "atanh_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "atanh_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "atanh_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "atanh_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "atanh_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "atanh_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr sqrt(Expr x) {
     user_assert(x.defined()) << "sqrt of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "sqrt_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "sqrt_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "sqrt_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "sqrt_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "sqrt_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "sqrt_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2118,22 +2169,22 @@ Expr hypot(const Expr &x, const Expr &y) {
 Expr exp(Expr x) {
     user_assert(x.defined()) << "exp of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "exp_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "exp_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "exp_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "exp_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "exp_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "exp_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr log(Expr x) {
     user_assert(x.defined()) << "log of undefined Expr\n";
     if (x.type() == Float(64)) {
-        return Internal::Call::make(Float(64), "log_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "log_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
-        return Internal::Call::make(Float(16), "log_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "log_f16", {std::move(x)}, Call::PureExtern);
     } else {
-        return Internal::Call::make(Float(32), "log_f32", {cast<float>(std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "log_f32", {cast<float>(std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2146,21 +2197,21 @@ Expr pow(Expr x, Expr y) {
 
     if (x.type() == Float(64)) {
         y = cast<double>(std::move(y));
-        return Internal::Call::make(Float(64), "pow_f64", {std::move(x), std::move(y)}, Internal::Call::PureExtern);
+        return Call::make(Float(64), "pow_f64", {std::move(x), std::move(y)}, Call::PureExtern);
     } else if (x.type() == Float(16)) {
         y = cast<float16_t>(std::move(y));
-        return Internal::Call::make(Float(16), "pow_f16", {std::move(x), std::move(y)}, Internal::Call::PureExtern);
+        return Call::make(Float(16), "pow_f16", {std::move(x), std::move(y)}, Call::PureExtern);
     } else {
         x = cast<float>(std::move(x));
         y = cast<float>(std::move(y));
-        return Internal::Call::make(Float(32), "pow_f32", {std::move(x), std::move(y)}, Internal::Call::PureExtern);
+        return Call::make(Float(32), "pow_f32", {std::move(x), std::move(y)}, Call::PureExtern);
     }
 }
 
 Expr erf(const Expr &x) {
     user_assert(x.defined()) << "erf of undefined Expr\n";
     user_assert(x.type() == Float(32)) << "erf only takes float arguments\n";
-    return Internal::halide_erf(x);
+    return halide_erf(x);
 }
 
 Expr fast_pow(Expr x, Expr y) {
@@ -2174,32 +2225,41 @@ Expr fast_pow(Expr x, Expr y) {
 }
 
 Expr fast_inverse(Expr x) {
-    user_assert(x.type() == Float(32)) << "fast_inverse only takes float arguments\n";
+    user_assert(x.defined()) << "fast_inverse of undefined Expr\n";
     Type t = x.type();
-    return Internal::Call::make(t, "fast_inverse_f32", {std::move(x)}, Internal::Call::PureExtern);
+    if (t == Float(32)) {
+        return Call::make(t, "fast_inverse_f32", {std::move(x)}, Call::PureExtern);
+    } else if (t == Float(16)) {
+        return Call::make(t, "fast_inverse_f16", {std::move(x)}, Call::PureExtern);
+    } else {
+        user_error << "fast_inverse only takes float16 or float32 arguments\n";
+        return Expr();
+    }
 }
 
 Expr fast_inverse_sqrt(Expr x) {
-    user_assert(x.type() == Float(32)) << "fast_inverse_sqrt only takes float arguments\n";
+    user_assert(x.defined()) << "fast_inverse_sqrt of undefined Expr\n";
     Type t = x.type();
-    return Internal::Call::make(t, "fast_inverse_sqrt_f32", {std::move(x)}, Internal::Call::PureExtern);
+    if (t == Float(32)) {
+        return Call::make(t, "fast_inverse_sqrt_f32", {std::move(x)}, Call::PureExtern);
+    } else if (t == Float(16)) {
+        return Call::make(t, "fast_inverse_sqrt_f16", {std::move(x)}, Call::PureExtern);
+    } else {
+        user_error << "fast_inverse_sqrt only takes float16 or float32 arguments\n";
+        return Expr();
+    }
 }
 
 Expr floor(Expr x) {
     user_assert(x.defined()) << "floor of undefined Expr\n";
     Type t = x.type();
     if (t.element_of() == Float(64)) {
-        return Internal::Call::make(t, "floor_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "floor_f64", {std::move(x)}, Call::PureExtern);
     } else if (t.element_of() == Float(16)) {
-        return Internal::Call::make(t, "floor_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "floor_f16", {std::move(x)}, Call::PureExtern);
     } else {
         t = Float(32, t.lanes());
-        if (t.is_int() || t.is_uint()) {
-            // Already an integer
-            return cast(t, std::move(x));
-        } else {
-            return Internal::Call::make(t, "floor_f32", {cast(t, std::move(x))}, Internal::Call::PureExtern);
-        }
+        return Call::make(t, "floor_f32", {cast(t, std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2207,53 +2267,35 @@ Expr ceil(Expr x) {
     user_assert(x.defined()) << "ceil of undefined Expr\n";
     Type t = x.type();
     if (t.element_of() == Float(64)) {
-        return Internal::Call::make(t, "ceil_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "ceil_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type().element_of() == Float(16)) {
-        return Internal::Call::make(t, "ceil_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "ceil_f16", {std::move(x)}, Call::PureExtern);
     } else {
         t = Float(32, t.lanes());
-        if (t.is_int() || t.is_uint()) {
-            // Already an integer
-            return cast(t, std::move(x));
-        } else {
-            return Internal::Call::make(t, "ceil_f32", {cast(t, std::move(x))}, Internal::Call::PureExtern);
-        }
+        return Call::make(t, "ceil_f32", {cast(t, std::move(x))}, Call::PureExtern);
     }
 }
 
 Expr round(Expr x) {
     user_assert(x.defined()) << "round of undefined Expr\n";
     Type t = x.type();
-    if (t.element_of() == Float(64)) {
-        return Internal::Call::make(t, "round_f64", {std::move(x)}, Internal::Call::PureExtern);
-    } else if (t.element_of() == Float(16)) {
-        return Internal::Call::make(t, "round_f16", {std::move(x)}, Internal::Call::PureExtern);
-    } else {
-        t = Float(32, t.lanes());
-        if (t.is_int() || t.is_uint()) {
-            // Already an integer
-            return cast(t, std::move(x));
-        } else {
-            return Internal::Call::make(t, "round_f32", {cast(t, std::move(x))}, Internal::Call::PureExtern);
-        }
+    if (!t.is_float()) {
+        x = cast<float>(x);
+        t = x.type();
     }
+    return Call::make(t, Call::round, {std::move(x)}, Call::PureIntrinsic);
 }
 
 Expr trunc(Expr x) {
     user_assert(x.defined()) << "trunc of undefined Expr\n";
     Type t = x.type();
     if (t.element_of() == Float(64)) {
-        return Internal::Call::make(t, "trunc_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "trunc_f64", {std::move(x)}, Call::PureExtern);
     } else if (t.element_of() == Float(16)) {
-        return Internal::Call::make(t, "trunc_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "trunc_f16", {std::move(x)}, Call::PureExtern);
     } else {
         t = Float(32, t.lanes());
-        if (t.is_int() || t.is_uint()) {
-            // Already an integer
-            return cast(t, std::move(x));
-        } else {
-            return Internal::Call::make(t, "trunc_f32", {cast(t, std::move(x))}, Internal::Call::PureExtern);
-        }
+        return Call::make(t, "trunc_f32", {cast(t, std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2265,12 +2307,12 @@ Expr is_nan(Expr x) {
         x = strict_float(x);
     }
     if (x.type().element_of() == Float(64)) {
-        return Internal::Call::make(t, "is_nan_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "is_nan_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type().element_of() == Float(16)) {
-        return Internal::Call::make(t, "is_nan_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "is_nan_f16", {std::move(x)}, Call::PureExtern);
     } else {
         Type ft = Float(32, t.lanes());
-        return Internal::Call::make(t, "is_nan_f32", {cast(ft, std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(t, "is_nan_f32", {cast(ft, std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2282,12 +2324,12 @@ Expr is_inf(Expr x) {
         x = strict_float(x);
     }
     if (x.type().element_of() == Float(64)) {
-        return Internal::Call::make(t, "is_inf_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "is_inf_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type().element_of() == Float(16)) {
-        return Internal::Call::make(t, "is_inf_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "is_inf_f16", {std::move(x)}, Call::PureExtern);
     } else {
         Type ft = Float(32, t.lanes());
-        return Internal::Call::make(t, "is_inf_f32", {cast(ft, std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(t, "is_inf_f32", {cast(ft, std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2299,12 +2341,12 @@ Expr is_finite(Expr x) {
         x = strict_float(x);
     }
     if (x.type().element_of() == Float(64)) {
-        return Internal::Call::make(t, "is_finite_f64", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "is_finite_f64", {std::move(x)}, Call::PureExtern);
     } else if (x.type().element_of() == Float(16)) {
-        return Internal::Call::make(t, "is_finite_f16", {std::move(x)}, Internal::Call::PureExtern);
+        return Call::make(t, "is_finite_f16", {std::move(x)}, Call::PureExtern);
     } else {
         Type ft = Float(32, t.lanes());
-        return Internal::Call::make(t, "is_finite_f32", {cast(ft, std::move(x))}, Internal::Call::PureExtern);
+        return Call::make(t, "is_finite_f32", {cast(ft, std::move(x))}, Call::PureExtern);
     }
 }
 
@@ -2314,69 +2356,61 @@ Expr fract(const Expr &x) {
 }
 
 Expr reinterpret(Type t, Expr e) {
-    user_assert(e.defined()) << "reinterpret of undefined Expr\n";
-    int from_bits = e.type().bits() * e.type().lanes();
-    int to_bits = t.bits() * t.lanes();
-    user_assert(from_bits == to_bits)
-        << "Reinterpret cast from type " << e.type()
-        << " which has " << from_bits
-        << " bits, to type " << t
-        << " which has " << to_bits << " bits\n";
-    return Internal::Call::make(t, Internal::Call::reinterpret, {std::move(e)}, Internal::Call::PureIntrinsic);
+    return Reinterpret::make(t, std::move(e));
 }
 
 Expr operator&(Expr x, Expr y) {
     match_types_bitwise(x, y, "bitwise and");
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::bitwise_and, {std::move(x), std::move(y)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::bitwise_and, {std::move(x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator&(Expr x, int y) {
     Type t = x.type();
-    Internal::check_representable(t, y);
-    return Internal::Call::make(t, Internal::Call::bitwise_and, {std::move(x), Internal::make_const(t, y)}, Internal::Call::PureIntrinsic);
+    check_representable(t, y);
+    return Call::make(t, Call::bitwise_and, {std::move(x), make_const(t, y)}, Call::PureIntrinsic);
 }
 
 Expr operator&(int x, Expr y) {
     Type t = y.type();
-    Internal::check_representable(t, x);
-    return Internal::Call::make(t, Internal::Call::bitwise_and, {Internal::make_const(t, x), std::move(y)}, Internal::Call::PureIntrinsic);
+    check_representable(t, x);
+    return Call::make(t, Call::bitwise_and, {make_const(t, x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator|(Expr x, Expr y) {
     match_types_bitwise(x, y, "bitwise or");
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::bitwise_or, {std::move(x), std::move(y)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::bitwise_or, {std::move(x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator|(Expr x, int y) {
     Type t = x.type();
-    Internal::check_representable(t, y);
-    return Internal::Call::make(t, Internal::Call::bitwise_or, {std::move(x), Internal::make_const(t, y)}, Internal::Call::PureIntrinsic);
+    check_representable(t, y);
+    return Call::make(t, Call::bitwise_or, {std::move(x), make_const(t, y)}, Call::PureIntrinsic);
 }
 
 Expr operator|(int x, Expr y) {
     Type t = y.type();
-    Internal::check_representable(t, x);
-    return Internal::Call::make(t, Internal::Call::bitwise_or, {Internal::make_const(t, x), std::move(y)}, Internal::Call::PureIntrinsic);
+    check_representable(t, x);
+    return Call::make(t, Call::bitwise_or, {make_const(t, x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator^(Expr x, Expr y) {
     match_types_bitwise(x, y, "bitwise xor");
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::bitwise_xor, {std::move(x), std::move(y)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::bitwise_xor, {std::move(x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator^(Expr x, int y) {
     Type t = x.type();
-    Internal::check_representable(t, y);
-    return Internal::Call::make(t, Internal::Call::bitwise_xor, {std::move(x), Internal::make_const(t, y)}, Internal::Call::PureIntrinsic);
+    check_representable(t, y);
+    return Call::make(t, Call::bitwise_xor, {std::move(x), make_const(t, y)}, Call::PureIntrinsic);
 }
 
 Expr operator^(int x, Expr y) {
     Type t = y.type();
-    Internal::check_representable(t, x);
-    return Internal::Call::make(t, Internal::Call::bitwise_xor, {Internal::make_const(t, x), std::move(y)}, Internal::Call::PureIntrinsic);
+    check_representable(t, x);
+    return Call::make(t, Call::bitwise_xor, {make_const(t, x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator~(Expr x) {
@@ -2384,24 +2418,24 @@ Expr operator~(Expr x) {
     user_assert(x.type().is_int() || x.type().is_uint())
         << "Argument to bitwise not must be an integer or unsigned integer";
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::bitwise_not, {std::move(x)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::bitwise_not, {std::move(x)}, Call::PureIntrinsic);
 }
 
 Expr operator<<(Expr x, Expr y) {
     match_lanes(x, y);
     match_bits(x, y);
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::shift_left, {std::move(x), std::move(y)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::shift_left, {std::move(x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator<<(Expr x, int y) {
     Type t = x.type().with_code(halide_type_uint);
     if (y >= 0) {
-        Internal::check_representable(t, y);
-        return std::move(x) << Internal::make_const(t, y);
+        check_representable(t, y);
+        return std::move(x) << make_const(t, y);
     } else {
-        Internal::check_representable(t, -y);
-        return std::move(x) >> Internal::make_const(t, -y);
+        check_representable(t, -y);
+        return std::move(x) >> make_const(t, -y);
     }
 }
 
@@ -2409,17 +2443,17 @@ Expr operator>>(Expr x, Expr y) {
     match_lanes(x, y);
     match_bits(x, y);
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::shift_right, {std::move(x), std::move(y)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::shift_right, {std::move(x), std::move(y)}, Call::PureIntrinsic);
 }
 
 Expr operator>>(Expr x, int y) {
     Type t = x.type().with_code(halide_type_uint);
     if (y >= 0) {
-        Internal::check_representable(t, y);
-        return std::move(x) >> Internal::make_const(t, y);
+        check_representable(t, y);
+        return std::move(x) >> make_const(t, y);
     } else {
-        Internal::check_representable(t, -y);
-        return std::move(x) << Internal::make_const(t, -y);
+        check_representable(t, -y);
+        return std::move(x) << make_const(t, -y);
     }
 }
 
@@ -2460,9 +2494,9 @@ Expr lerp(Expr zero_val, Expr one_val, Expr weight) {
         }
     }
     Type t = zero_val.type();
-    return Internal::Call::make(t, Internal::Call::lerp,
-                                {std::move(zero_val), std::move(one_val), std::move(weight)},
-                                Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::lerp,
+                      {std::move(zero_val), std::move(one_val), std::move(weight)},
+                      Call::PureIntrinsic);
 }
 
 Expr popcount(Expr x) {
@@ -2470,8 +2504,8 @@ Expr popcount(Expr x) {
     Type t = x.type();
     user_assert(t.is_uint() || t.is_int())
         << "Argument to popcount must be an integer\n";
-    return Internal::Call::make(t, Internal::Call::popcount,
-                                {std::move(x)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::popcount,
+                      {std::move(x)}, Call::PureIntrinsic);
 }
 
 Expr count_leading_zeros(Expr x) {
@@ -2479,8 +2513,8 @@ Expr count_leading_zeros(Expr x) {
     Type t = x.type();
     user_assert(t.is_uint() || t.is_int())
         << "Argument to count_leading_zeros must be an integer\n";
-    return Internal::Call::make(t, Internal::Call::count_leading_zeros,
-                                {std::move(x)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::count_leading_zeros,
+                      {std::move(x)}, Call::PureIntrinsic);
 }
 
 Expr count_trailing_zeros(Expr x) {
@@ -2488,38 +2522,38 @@ Expr count_trailing_zeros(Expr x) {
     Type t = x.type();
     user_assert(t.is_uint() || t.is_int())
         << "Argument to count_trailing_zeros must be an integer\n";
-    return Internal::Call::make(t, Internal::Call::count_trailing_zeros,
-                                {std::move(x)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::count_trailing_zeros,
+                      {std::move(x)}, Call::PureIntrinsic);
 }
 
 Expr div_round_to_zero(Expr x, Expr y) {
     user_assert(x.defined()) << "div_round_to_zero of undefined dividend\n";
     user_assert(y.defined()) << "div_round_to_zero of undefined divisor\n";
-    Internal::match_types(x, y);
+    match_types(x, y);
     if (x.type().is_uint()) {
         return std::move(x) / std::move(y);
     }
     user_assert(x.type().is_int()) << "First argument to div_round_to_zero is not an integer: " << x << "\n";
     user_assert(y.type().is_int()) << "Second argument to div_round_to_zero is not an integer: " << y << "\n";
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::div_round_to_zero,
-                                {std::move(x), std::move(y)},
-                                Internal::Call::Intrinsic);
+    return Call::make(t, Call::div_round_to_zero,
+                      {std::move(x), std::move(y)},
+                      Call::PureIntrinsic);
 }
 
 Expr mod_round_to_zero(Expr x, Expr y) {
     user_assert(x.defined()) << "mod_round_to_zero of undefined dividend\n";
     user_assert(y.defined()) << "mod_round_to_zero of undefined divisor\n";
-    Internal::match_types(x, y);
+    match_types(x, y);
     if (x.type().is_uint()) {
         return std::move(x) % std::move(y);
     }
     user_assert(x.type().is_int()) << "First argument to mod_round_to_zero is not an integer: " << x << "\n";
     user_assert(y.type().is_int()) << "Second argument to mod_round_to_zero is not an integer: " << y << "\n";
     Type t = x.type();
-    return Internal::Call::make(t, Internal::Call::mod_round_to_zero,
-                                {std::move(x), std::move(y)},
-                                Internal::Call::Intrinsic);
+    return Call::make(t, Call::mod_round_to_zero,
+                      {std::move(x), std::move(y)},
+                      Call::PureIntrinsic);
 }
 
 Expr random_float(Expr seed) {
@@ -2538,8 +2572,8 @@ Expr random_float(Expr seed) {
 
     // This is (surprisingly) pure - it's a fixed psuedo-random
     // function of its inputs.
-    return Internal::Call::make(Float(32), Internal::Call::random,
-                                args, Internal::Call::PureIntrinsic);
+    return Call::make(Float(32), Call::random,
+                      args, Call::PureIntrinsic);
 }
 
 Expr random_uint(Expr seed) {
@@ -2556,8 +2590,8 @@ Expr random_uint(Expr seed) {
     }
     args.emplace_back(id);
 
-    return Internal::Call::make(UInt(32), Internal::Call::random,
-                                args, Internal::Call::PureIntrinsic);
+    return Call::make(UInt(32), Call::random,
+                      args, Call::PureIntrinsic);
 }
 
 Expr random_int(Expr seed) {
@@ -2566,36 +2600,41 @@ Expr random_int(Expr seed) {
 
 Expr likely(Expr e) {
     Type t = e.type();
-    return Internal::Call::make(t, Internal::Call::likely,
-                                {std::move(e)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::likely,
+                      {std::move(e)}, Call::PureIntrinsic);
 }
 
 Expr likely_if_innermost(Expr e) {
     Type t = e.type();
-    return Internal::Call::make(t, Internal::Call::likely_if_innermost,
-                                {std::move(e)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::likely_if_innermost,
+                      {std::move(e)}, Call::PureIntrinsic);
 }
 
 Expr strict_float(Expr e) {
     Type t = e.type();
-    return Internal::Call::make(t, Internal::Call::strict_float,
-                                {std::move(e)}, Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::strict_float,
+                      {std::move(e)}, Call::PureIntrinsic);
 }
 
 Expr undef(Type t) {
-    return Internal::Call::make(t, Internal::Call::undef,
-                                std::vector<Expr>(),
-                                Internal::Call::PureIntrinsic);
+    return Call::make(t, Call::undef,
+                      std::vector<Expr>(),
+                      Call::Intrinsic);
 }
+
+namespace Internal {
+Expr unreachable(Type t) {
+    return Call::make(t, Call::unreachable,
+                      std::vector<Expr>(),
+                      Call::Intrinsic);
+}
+}  // namespace Internal
 
 namespace {
 Expr make_scatter_gather(const std::vector<Expr> &args) {
     // There's currently no difference in the IR between a gather and
     // a scatter. They're distinct just to make code more readable.
-    return Halide::Internal::Call::make(args[0].type(),
-                                        Halide::Internal::Call::scatter_gather,
-                                        args,
-                                        Halide::Internal::Call::PureIntrinsic);
+    return Call::make(args[0].type(), Call::scatter_gather, args, Call::Intrinsic);
 }
 }  // namespace
 
@@ -2605,6 +2644,20 @@ Expr scatter(const std::vector<Expr> &args) {
 
 Expr gather(const std::vector<Expr> &args) {
     return make_scatter_gather(args);
+}
+
+Expr extract_bits(Type t, const Expr &e, const Expr &lsb) {
+    return Call::make(t, Call::extract_bits, {e, lsb}, Call::Intrinsic);
+}
+
+Expr concat_bits(const std::vector<Expr> &e) {
+    user_assert(!e.empty()) << "concat_bits requires at least one argument\n";
+    user_assert((e.size() & (e.size() - 1)) == 0) << "concat_bits received " << e.size() << " arguments, which is not a power of two.\n";
+    Type t = e[0].type();
+    for (size_t i = 1; i < e.size(); i++) {
+        user_assert(e[i].type() == t) << "All arguments to concat_bits must have the same type\n";
+    }
+    return Call::make(t.with_bits(t.bits() * (int)e.size()), Call::concat_bits, e, Call::Intrinsic);
 }
 
 }  // namespace Halide

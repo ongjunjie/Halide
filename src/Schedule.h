@@ -48,15 +48,38 @@ enum class TailStrategy {
      * case to handle the if statement. */
     GuardWithIf,
 
-    /** Guard the inner loop with an if statement that prevents
-     * evaluation beyond the original extent, with a hint that the
-     * if statement should be implemented with predicated operations.
-     * Always legal. The if statement is treated like a boundary
-     * condition, and factored out into a loop epilogue if possible.
-     * Pros: no redundant re-evaluation; does not constrain input our
+    /** Guard the loads and stores in the loop with an if statement
+     * that prevents evaluation beyond the original extent. Always
+     * legal. The if statement is treated like a boundary condition,
+     * and factored out into a loop epilogue if possible.
+     * Pros: no redundant re-evaluation; does not constrain input or
      * output sizes. Cons: increases code size due to separate
      * tail-case handling. */
     Predicate,
+
+    /** Guard the loads in the loop with an if statement that
+     * prevents evaluation beyond the original extent. Only legal
+     * for innermost splits. Not legal for RVars, as it would change
+     * the meaning of the algorithm. The if statement is treated like
+     * a boundary condition, and factored out into a loop epilogue if
+     * possible.
+     * Pros: does not constrain input sizes, output size constraints
+     * are simpler than full predication. Cons: increases code size
+     * due to separate tail-case handling, constrains the output size
+     * to be a multiple of the split factor. */
+    PredicateLoads,
+
+    /** Guard the stores in the loop with an if statement that
+     * prevents evaluation beyond the original extent. Only legal
+     * for innermost splits. Not legal for RVars, as it would change
+     * the meaning of the algorithm. The if statement is treated like
+     * a boundary condition, and factored out into a loop epilogue if
+     * possible.
+     * Pros: does not constrain output sizes, input size constraints
+     * are simpler than full predication. Cons: increases code size
+     * due to separate tail-case handling, constraints the input size
+     * to be a multiple of the split factor.. */
+    PredicateStores,
 
     /** Prevent evaluation beyond the original extent by shifting
      * the tail case inwards, re-evaluating some points near the
@@ -259,8 +282,8 @@ struct Split {
     std::string old_var, outer, inner;
     Expr factor;
     bool exact;  // Is it required that the factor divides the extent
-        // of the old var. True for splits of RVars. Forces
-        // tail strategy to be GuardWithIf.
+                 // of the old var. True for splits of RVars. Forces
+                 // tail strategy to be GuardWithIf.
     TailStrategy tail;
 
     enum SplitType { SplitVar = 0,
@@ -455,6 +478,9 @@ struct StorageDim {
     /** The bounds allocated (not computed) must be a multiple of
      * "alignment". Set by Func::align_storage. */
     Expr alignment;
+
+    /** The bounds allocated (not computed). Set by Func::bound_storage. */
+    Expr bound;
 
     /** If the Func is explicitly folded along this axis (with
      * Func::fold_storage) this gives the extent of the circular

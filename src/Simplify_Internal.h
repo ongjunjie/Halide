@@ -29,14 +29,13 @@ namespace Halide {
 namespace Internal {
 
 inline int64_t saturating_mul(int64_t a, int64_t b) {
-    if (mul_would_overflow(64, a, b)) {
-        if ((a > 0) == (b > 0)) {
-            return INT64_MAX;
-        } else {
-            return INT64_MIN;
-        }
+    int64_t result;
+    if (mul_with_overflow(64, a, b, &result)) {
+        return result;
+    } else if ((a > 0) == (b > 0)) {
+        return INT64_MAX;
     } else {
-        return a * b;
+        return INT64_MIN;
     }
 }
 
@@ -103,7 +102,14 @@ public:
         }
     };
 
-#if (LOG_EXPR_MUTATORIONS || LOG_STMT_MUTATIONS)
+    HALIDE_ALWAYS_INLINE
+    void clear_bounds_info(ExprInfo *b) {
+        if (b) {
+            *b = ExprInfo{};
+        }
+    }
+
+#if (LOG_EXPR_MUTATIONS || LOG_STMT_MUTATIONS)
     static int debug_indent;
 #endif
 
@@ -151,7 +157,7 @@ public:
     }
 #endif
 
-    bool remove_dead_lets;
+    bool remove_dead_code;
     bool no_float_simplify;
 
     HALIDE_ALWAYS_INLINE
@@ -205,6 +211,9 @@ public:
     // transformations are not a good idea if the code is to be
     // vectorized.
     bool in_vector_loop = false;
+
+    // Tracks whether or not the current IR is unconditionally unreachable.
+    bool in_unreachable = false;
 
     // If we encounter a reference to a buffer (a Load, Store, Call,
     // or Provide), there's an implicit dependence on some associated
@@ -280,9 +289,6 @@ public:
         return f;
     }
 
-    template<typename T>
-    Expr hoist_slice_vector(Expr e);
-
     Stmt mutate_let_body(const Stmt &s, ExprInfo *) {
         return mutate(s);
     }
@@ -299,6 +305,7 @@ public:
     Expr visit(const StringImm *op, ExprInfo *bounds);
     Expr visit(const Broadcast *op, ExprInfo *bounds);
     Expr visit(const Cast *op, ExprInfo *bounds);
+    Expr visit(const Reinterpret *op, ExprInfo *bounds);
     Expr visit(const Variable *op, ExprInfo *bounds);
     Expr visit(const Add *op, ExprInfo *bounds);
     Expr visit(const Sub *op, ExprInfo *bounds);
@@ -339,6 +346,8 @@ public:
     Stmt visit(const Acquire *op);
     Stmt visit(const Fork *op);
     Stmt visit(const Atomic *op);
+
+    std::pair<std::vector<Expr>, bool> mutate_with_changes(const std::vector<Expr> &old_exprs, ExprInfo *bounds);
 };
 
 }  // namespace Internal
