@@ -323,6 +323,16 @@ void JITModule::compile_module(std::unique_ptr<llvm::Module> m, const string &fu
     debug(2) << "Target triple: " << m->getTargetTriple() << "\n";
     string error_string;
 
+    // Stack probe is needed to page in sufficient memory when local stack
+    // size exceeds 4k. Unfortunately, this relies on __chkstk_ms, which is
+    // provided by libgcc_s.a. I have not figured out how to link a static
+    // library during JIT, so as a workaround, stack probe is disabled. This
+    // will cause programs with very large local stacks to segfault, but such
+    // programs should be rare.
+    if (target.has_feature(Target::MinGW)) {
+        m->addModuleFlag(llvm::Module::Warning, "halide_no_stack_probe", 1);
+    }
+
     llvm::for_each(*m, set_function_attributes_from_halide_target_options);
 
     llvm::TargetOptions options;
