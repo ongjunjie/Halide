@@ -90,7 +90,7 @@ add_dependencies(PythonCorrectnessGenerators "pyext_multi_method_module")
 # TODO: _Halide_target_export_single_symbol() isn't implemented for MSVC, and even if it was,
 # this test wouldn't work for it, but for Posixy systems (Linux, OSX, etc) this is fine.
 # See https://github.com/halide/Halide/issues/6982
-if(NOT MSVC)
+if(NOT WIN32)
     # Verify that only one symbol is exported, and that symbol is the one we expect
     add_test(NAME test_export_single_symbol
              COMMAND $ENV{SHELL} -c "[ $(nm $<TARGET_FILE:pyext_multi_method_module> | grep ' T ' | wc -l) -eq 1 ] && \

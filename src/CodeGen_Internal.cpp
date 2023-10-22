@@ -704,6 +704,12 @@ void set_function_attributes_from_halide_target_options(llvm::Function &fn) {
     if (!vscale_range.empty()) {
         fn.addFnAttr("vscale_range", vscale_range);
     }
+
+    bool no_stack_probe = false;
+    get_md_bool(module.getModuleFlag("halide_no_stack_probe"), no_stack_probe);
+    if (no_stack_probe) {
+        fn.addFnAttr("no-stack-arg-probe");
+    }
 }
 
 void embed_bitcode(llvm::Module *M, const string &halide_command) {

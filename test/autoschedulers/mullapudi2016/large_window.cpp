@@ -8,6 +8,11 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (get_jit_target_from_environment().has_feature(Target::MinGW)) {
+        printf("[SKIP] Not supported on MinGW.\n");
+        return 0;
+    }
+
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <autoscheduler-lib>\n", argv[0]);
         return 1;

@@ -46,7 +46,7 @@
 #define NOMINMAX
 #endif
 
-#if !defined(_WIN32)
+#if !defined(MSVC)
 #include <cxxabi.h>
 #else
 #include <windows.h>
@@ -131,7 +131,7 @@ Target lexical_cast(const Source &arg) {
 }
 
 static inline std::string demangle(const std::string &name) {
-#if !defined(_WIN32)
+#if !defined(MSVC)
     int status = 0;
     char *p = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
     std::string ret(p);

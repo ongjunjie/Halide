@@ -17,7 +17,7 @@
 #include <sstream>
 #include <string>
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 #include <io.h>
 #else
 #include <cstdlib>
@@ -32,7 +32,7 @@
 #include <linux/limits.h>  // For PATH_MAX
 #include <ucontext.h>      // For swapcontext
 #endif
-#if defined(_MSC_VER) && !defined(NOMINMAX)
+#if defined(_WIN32) && !defined(NOMINMAX)
 #define NOMINMAX
 #endif
 #ifdef _WIN32

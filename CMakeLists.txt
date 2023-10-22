@@ -3,6 +3,7 @@ project(Halide
         VERSION 16.0.0
         DESCRIPTION "Halide compiler and libraries"
         HOMEPAGE_URL "https://halide-lang.org")
+set(CMAKE_SHARED_LIBRARY_SUFFIX "-cv${CMAKE_SHARED_LIBRARY_SUFFIX}")
 
 enable_testing()
 

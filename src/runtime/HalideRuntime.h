@@ -70,6 +70,8 @@ extern "C" {
 #ifndef HALIDE_EXPORT_SYMBOL
 #ifdef _MSC_VER
 #define HALIDE_EXPORT_SYMBOL __declspec(dllexport)
+#elif !defined(Halide_EXPORTS) && defined(__MINGW32__)
+#define HALIDE_EXPORT_SYMBOL __attribute__((dllexport))
 #else
 #define HALIDE_EXPORT_SYMBOL __attribute__((visibility("default")))
 #endif
