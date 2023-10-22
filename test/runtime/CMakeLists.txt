@@ -26,7 +26,7 @@ function(halide_define_runtime_internal_test NAME)
 endfunction()
 
 # NOTE: These tests directly include runtime_internal.h which isn't compatible with MSVC
-if(NOT MSVC)
+if(NOT MSVC AND NOT MINGW)
     # Weak linkages are easier to get right with OBJECT libraries
     add_library(runtime_internal_common OBJECT
                 common.cpp
